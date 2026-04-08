@@ -26,6 +26,8 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+import threading
+PREDICT_LOCK = threading.Lock()
 
 # ============================================================
 # CONFIG
@@ -352,69 +354,7 @@ def predict_final_recommendations(env_df, fused_disease_probs):
 # ============================================================
 
 def generate_gradcam_base64(image_path):
-    try:
-        cnn = MODELS["cnn"]
-
-        img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
-        img_arr = tf.keras.utils.img_to_array(img)
-        img_proc = tf.keras.applications.efficientnet.preprocess_input(
-            np.expand_dims(img_arr.copy(), axis=0).astype(np.float32)
-        )
-        img_tensor = tf.convert_to_tensor(img_proc, dtype=tf.float32)
-
-        base_model = None
-        for layer in cnn.layers:
-            if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower():
-                base_model = layer
-                break
-
-        if base_model is None:
-            return None
-
-        target_layer = base_model.get_layer("top_conv")
-
-        grad_model = tf.keras.Model(
-            inputs=cnn.inputs,
-            outputs=[target_layer.output, cnn.output]
-        )
-
-        with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(img_tensor, training=False)
-            pred_idx = tf.argmax(preds[0])
-            class_ch = preds[:, pred_idx]
-
-        grads = tape.gradient(class_ch, conv_out)
-        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
-
-        heatmap = np.maximum(heatmap, 0)
-        heatmap /= (heatmap.max() + 1e-8)
-
-        heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
-        colormap = cm_module.get_cmap("jet")
-        heatmap_c = colormap(heatmap_r)[:, :, :3]
-        overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * heatmap_c, 0, 1)
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(img_arr.astype(np.uint8))
-        axes[0].set_title("Input Leaf")
-        axes[0].axis("off")
-
-        axes[1].imshow(overlay)
-        axes[1].set_title("Grad-CAM")
-        axes[1].axis("off")
-
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-
-        return base64.b64encode(buf.read()).decode("utf-8")
-
-    except Exception as e:
-        print(f"[WARN] Grad-CAM failed: {e}")
-        return None
+    return None
 
 # ============================================================
 # FLASK APP
@@ -876,7 +816,8 @@ def predict():
     if not MODELS_READY:
         return jsonify({"error": "Models are still loading. Please wait 1–2 minutes and try again."}), 503
 
-    tmp_path = None
+    with PREDICT_LOCK:
+        tmp_path = None
     try:
         if "image" not in request.files:
             return jsonify({"error": "No image file uploaded"}), 400
@@ -909,7 +850,7 @@ def predict():
 
         predicted_disease = max(fused, key=fused.get)
         confidence        = fused[predicted_disease]
-        gradcam_b64       = generate_gradcam_base64(tmp_path)
+        gradcam_b64       = None
 
         response = {
             "predicted_disease":        str(predicted_disease),
