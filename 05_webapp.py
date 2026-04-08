@@ -445,9 +445,8 @@ HTML_PAGE = """<!DOCTYPE html>
   label{display:block;font-size:0.8rem;font-weight:500;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.5px;}
   input,select{width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:0.95rem;background:#fafafa;transition:border-color 0.2s;}
   input:focus,select:focus{outline:none;border-color:var(--green-lt);}
-  .upload-area{border:2px dashed var(--green-lt);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:background 0.2s;background:#f7fdf9;}
+  .upload-area{display:block;border:2px dashed var(--green-lt);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:background 0.2s;background:#f7fdf9;}
   .upload-area:hover{background:#edf7f0;}
-  .upload-area input[type="file"]{display:none;}
   .upload-area .icon{font-size:2.5rem;margin-bottom:8px;}
   .upload-area p{color:var(--muted);font-size:0.9rem;}
   #preview-img{max-width:100%;border-radius:10px;margin-top:14px;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.12);}
@@ -490,12 +489,12 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="main">
   <div class="card">
     <h2>📷 Leaf Image</h2>
-    <div class="upload-area" onclick="document.getElementById('file-input').click()">
-      <input type="file" id="file-input" accept="image/*" onchange="handleFileSelect(this)">
+    <label for="file-input" class="upload-area">
+      <input type="file" id="file-input" accept="image/*" onchange="handleFileSelect(this)" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;">
       <div class="icon">🍃</div>
       <p>Click to upload a sugarcane leaf photo</p>
       <p style="font-size:0.75rem;margin-top:4px">JPG, PNG, WEBP supported</p>
-    </div>
+    </label>
     <img id="preview-img" src="" alt="Preview">
   </div>
   <div class="card">
