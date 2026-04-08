@@ -773,25 +773,20 @@ function showError(msg) {
 
 
 # ============================================================
-# STARTUP — background thread so port opens immediately
+# STARTUP — load models at import time (works with --preload)
 # ============================================================
-import threading
+import traceback as _tb
 
 MODELS_READY = False
 MODELS_ERROR = None
 
-def load_models_background():
-    global MODELS_READY, MODELS_ERROR
-    try:
-        load_all_models()
-        MODELS_READY = True
-        print("[STARTUP] Models ready — app fully operational.")
-    except Exception as e:
-        import traceback
-        MODELS_ERROR = traceback.format_exc()
-        print(f"[STARTUP ERROR] {e}")
-
-threading.Thread(target=load_models_background, daemon=True).start()
+try:
+    load_all_models()
+    MODELS_READY = True
+    print("[STARTUP] Models ready — app fully operational.")
+except Exception as _e:
+    MODELS_ERROR = _tb.format_exc()
+    print(f"[STARTUP ERROR] {_e}")
 
 # ============================================================
 # FLASK ROUTES
