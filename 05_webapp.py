@@ -1,3 +1,6 @@
+!pip install flask flask-cors
+!pip install flask-cors
+!pip install gdown
 """
 CODE 05 — Web Application (Flask — Permanent Deployment)
 =========================================================
@@ -29,7 +32,7 @@ from flask_cors import CORS
 # ============================================================
 # CONFIG
 # ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.getcwd()
 ARTIFACT_DIR = os.path.join(BASE_DIR, "artifacts")
 ARTIFACT_ZIP_PATH = os.path.join(BASE_DIR, "artifacts.zip")
 
@@ -118,29 +121,14 @@ MODELS = {}
 # ============================================================
 
 def download_file_from_drive(file_id, destination):
-    url = "https://drive.google.com/uc?export=download"
-    session = requests.Session()
+    import gdown
+    import os
 
-    response = session.get(url, params={"id": file_id}, stream=True)
-    token = None
+    url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(url, destination, quiet=False, fuzzy=True)
 
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-
-    if token:
-        response = session.get(
-            url,
-            params={"id": file_id, "confirm": token},
-            stream=True
-        )
-
-    response.raise_for_status()
-
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(32768):
-            if chunk:
-                f.write(chunk)
+    print("[DEBUG] Saved:", destination)
+    print("[DEBUG] Size:", os.path.getsize(destination))
 
 def ensure_artifacts_downloaded():
     if os.path.exists(CNN_WEIGHTS_PATH):
@@ -159,12 +147,13 @@ def ensure_artifacts_downloaded():
 
     download_file_from_drive(ARTIFACTS_ZIP_FILE_ID, ARTIFACT_ZIP_PATH)
 
-    print("[INFO] Extracting artifacts.zip ...")
+    print("[DEBUG] Downloaded file path:", ARTIFACT_ZIP_PATH)
+    print("[DEBUG] Downloaded file size:", os.path.getsize(ARTIFACT_ZIP_PATH))
+
     with zipfile.ZipFile(ARTIFACT_ZIP_PATH, "r") as zip_ref:
         zip_ref.extractall(BASE_DIR)
 
     print("[INFO] Artifacts extracted successfully.")
-
 # ============================================================
 # HELPERS
 # ============================================================

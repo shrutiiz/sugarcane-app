@@ -10,3 +10,4 @@ tensorflow
 scikit-learn
 xgboost
 requests
+gdown
