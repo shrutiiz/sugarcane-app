@@ -430,103 +430,121 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>SugarCane AI — Disease & Fertilizer Advisor</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-  :root{--green:#2d6a4f;--green-lt:#52b788;--cream:#fefae0;--amber:#d4a017;--rust:#bc4749;--text:#1a1a2e;--muted:#5c5c6e;--card-bg:#ffffff;--border:#e0e0e0;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'DM Sans',sans-serif;background:var(--cream);color:var(--text);min-height:100vh;}
-  header{background:var(--green);color:white;padding:20px 40px;display:flex;align-items:center;gap:16px;}
-  header h1{font-family:'DM Serif Display',serif;font-size:1.8rem;font-weight:400;}
-  header span{font-size:2rem;}
-  .subtitle{font-size:0.85rem;color:rgba(255,255,255,0.75);margin-top:2px;}
-  .main{max-width:960px;margin:0 auto;padding:32px 20px;}
-  .card{background:var(--card-bg);border-radius:16px;padding:28px;margin-bottom:24px;border:1px solid var(--border);box-shadow:0 2px 12px rgba(0,0,0,0.06);}
-  .card h2{font-family:'DM Serif Display',serif;font-size:1.3rem;font-weight:400;color:var(--green);margin-bottom:20px;padding-bottom:10px;border-bottom:1px solid var(--border);}
-  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
-  .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;}
-  label{display:block;font-size:0.8rem;font-weight:500;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.5px;}
-  input,select{width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:0.95rem;background:#fafafa;transition:border-color 0.2s;}
-  input:focus,select:focus{outline:none;border-color:var(--green-lt);}
-  .upload-area{display:block;border:2px dashed var(--green-lt);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:background 0.2s;background:#f7fdf9;}
-  .upload-area:hover{background:#edf7f0;}
-  .upload-area .icon{font-size:2.5rem;margin-bottom:8px;}
-  .upload-area p{color:var(--muted);font-size:0.9rem;}
-  #preview-img{max-width:100%;border-radius:10px;margin-top:14px;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.12);}
-  .btn-predict{width:100%;padding:14px;background:var(--green);color:white;border:none;border-radius:12px;font-family:'DM Sans',sans-serif;font-size:1rem;font-weight:500;cursor:pointer;transition:background 0.2s;margin-top:4px;}
-  .btn-predict:hover{background:#245a40;}
-  .btn-predict:disabled{background:#aaa;cursor:not-allowed;}
-  #result-section{display:none;}
-  .disease-badge{display:inline-block;padding:6px 18px;border-radius:99px;font-weight:500;font-size:1rem;background:var(--green);color:white;margin-bottom:12px;}
-  .confidence-bar-wrap{margin:8px 0 18px;}
-  .confidence-bar-wrap span{font-size:0.8rem;color:var(--muted);}
-  .bar-track{background:#e8f5ec;border-radius:99px;height:10px;margin-top:4px;}
-  .bar-fill{background:var(--green-lt);height:100%;border-radius:99px;transition:width 0.6s ease;}
-  .prob-row{display:flex;justify-content:space-between;align-items:center;margin:8px 0;font-size:0.9rem;}
-  .prob-label{color:var(--text);}
-  .prob-val{color:var(--green);font-weight:500;}
-  .prob-mini-bar{height:5px;background:var(--green-lt);border-radius:3px;margin-top:3px;}
-  .advisory-list{list-style:none;}
-  .advisory-list li{padding:8px 12px;background:#fff9e6;border-radius:8px;margin-bottom:8px;font-size:0.9rem;border-left:3px solid var(--amber);}
-  .fert-card{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:#f5faf7;border-radius:10px;margin-bottom:8px;border:1px solid #d6ede3;}
-  .fert-name{font-weight:500;color:var(--green);}
-  .fert-prob{font-size:0.9rem;color:var(--muted);}
-  .fert-rank{font-size:1.1rem;font-weight:600;color:var(--amber);min-width:26px;}
-  .alpha-info{background:#f0f4ff;border-radius:8px;padding:10px 14px;font-size:0.85rem;color:#3a4a7a;margin-bottom:16px;border-left:3px solid #667eea;}
-  #gradcam-img{max-width:100%;border-radius:10px;margin-top:10px;display:none;}
-  .spinner{display:none;width:36px;height:36px;border:4px solid #e0e0e0;border-top-color:var(--green);border-radius:50%;animation:spin 0.8s linear infinite;margin:20px auto;}
-  @keyframes spin{to{transform:rotate(360deg);}}
-  .status-msg{text-align:center;color:var(--muted);font-size:0.9rem;margin-top:8px;display:none;}
-  .error-msg{background:#ffeef0;border-left:3px solid var(--rust);border-radius:8px;padding:12px 16px;color:#8b0000;font-size:0.9rem;display:none;white-space:pre-wrap;}
-  @media(max-width:600px){.grid-2,.grid-3{grid-template-columns:1fr;}}
+  :root {
+    --green: #2d6a4f; --green-lt: #52b788; --cream: #fefae0;
+    --amber: #d4a017; --rust: #bc4749; --text: #1a1a2e;
+    --muted: #5c5c6e; --card-bg: #ffffff; --border: #e0e0e0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'DM Sans', sans-serif; background: var(--cream); color: var(--text); min-height: 100vh; }
+  header { background: var(--green); color: white; padding: 20px 40px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-family: 'DM Serif Display', serif; font-size: 1.8rem; font-weight: 400; }
+  header span { font-size: 2rem; }
+  .subtitle { font-size: 0.85rem; color: rgba(255,255,255,0.75); margin-top: 2px; }
+  .main { max-width: 960px; margin: 0 auto; padding: 32px 20px; }
+  .card { background: var(--card-bg); border-radius: 16px; padding: 28px; margin-bottom: 24px; border: 1px solid var(--border); box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+  .card h2 { font-family: 'DM Serif Display', serif; font-size: 1.3rem; font-weight: 400; color: var(--green); margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  label.field { display: block; font-size: 0.8rem; font-weight: 500; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
+  input[type="number"], select { width: 100%; padding: 10px 14px; border: 1.5px solid var(--border); border-radius: 10px; font-family: 'DM Sans', sans-serif; font-size: 0.95rem; background: #fafafa; transition: border-color 0.2s; }
+  input[type="number"]:focus, select:focus { outline: none; border-color: var(--green-lt); }
+  #file-input { display: none; }
+  .upload-label { display: block; border: 2px dashed var(--green-lt); border-radius: 12px; padding: 32px; text-align: center; cursor: pointer; transition: background 0.2s; background: #f7fdf9; }
+  .upload-label:hover { background: #edf7f0; }
+  .upload-label .icon { font-size: 2.5rem; margin-bottom: 8px; }
+  .upload-label p { color: var(--muted); font-size: 0.9rem; }
+  #file-name-display { margin-top: 10px; font-size: 0.85rem; color: var(--green); font-weight: 500; display: none; text-align: center; }
+  #preview-img { max-width: 100%; border-radius: 10px; margin-top: 14px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+  .btn-predict { width: 100%; padding: 14px; background: var(--green); color: white; border: none; border-radius: 12px; font-family: 'DM Sans', sans-serif; font-size: 1rem; font-weight: 500; cursor: pointer; transition: background 0.2s; margin-top: 4px; }
+  .btn-predict:hover { background: #245a40; }
+  .btn-predict:disabled { background: #aaa; cursor: not-allowed; }
+  #result-section { display: none; }
+  .disease-badge { display: inline-block; padding: 6px 18px; border-radius: 99px; font-weight: 500; font-size: 1rem; background: var(--green); color: white; margin-bottom: 12px; }
+  .confidence-bar-wrap { margin: 8px 0 18px; }
+  .confidence-bar-wrap span { font-size: 0.8rem; color: var(--muted); }
+  .bar-track { background: #e8f5ec; border-radius: 99px; height: 10px; margin-top: 4px; }
+  .bar-fill { background: var(--green-lt); height: 100%; border-radius: 99px; transition: width 0.6s ease; }
+  .prob-row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; font-size: 0.9rem; }
+  .prob-label { color: var(--text); }
+  .prob-val { color: var(--green); font-weight: 500; }
+  .prob-mini-bar { height: 5px; background: var(--green-lt); border-radius: 3px; margin-top: 3px; }
+  .advisory-list { list-style: none; }
+  .advisory-list li { padding: 8px 12px; background: #fff9e6; border-radius: 8px; margin-bottom: 8px; font-size: 0.9rem; border-left: 3px solid var(--amber); }
+  .fert-card { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: #f5faf7; border-radius: 10px; margin-bottom: 8px; border: 1px solid #d6ede3; }
+  .fert-name { font-weight: 500; color: var(--green); }
+  .fert-prob { font-size: 0.9rem; color: var(--muted); }
+  .fert-rank { font-size: 1.1rem; font-weight: 600; color: var(--amber); min-width: 26px; }
+  .alpha-info { background: #f0f4ff; border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; color: #3a4a7a; margin-bottom: 16px; border-left: 3px solid #667eea; }
+  #gradcam-card { display: none; }
+  #gradcam-img { max-width: 100%; border-radius: 10px; margin-top: 10px; }
+  .spinner { display: none; width: 36px; height: 36px; border: 4px solid #e0e0e0; border-top-color: var(--green); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 20px auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status-msg { text-align: center; color: var(--muted); font-size: 0.9rem; margin-top: 8px; display: none; padding: 10px; }
+  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; white-space: pre-wrap; margin-top: 12px; }
+  @media (max-width: 600px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } header { padding: 16px 20px; } }
 </style>
 </head>
 <body>
 <header>
-  <span>🌿</span>
+  <span>&#127807;</span>
   <div>
     <h1>SugarCane AI Advisor</h1>
     <div class="subtitle">Multimodal Disease Detection &amp; Fertilizer / Pesticide Recommendation</div>
   </div>
 </header>
+
 <div class="main">
+
   <div class="card">
-    <h2>📷 Leaf Image</h2>
-    <label for="file-input" class="upload-area">
-      <input type="file" id="file-input" accept="image/*" onchange="handleFileSelect(this)" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;">
-      <div class="icon">🍃</div>
-      <p>Click to upload a sugarcane leaf photo</p>
-      <p style="font-size:0.75rem;margin-top:4px">JPG, PNG, WEBP supported</p>
+    <h2>&#128247; Leaf Image</h2>
+    <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp,image/jpg">
+    <label for="file-input" class="upload-label">
+      <div class="icon">&#127807;</div>
+      <p>Click here to select a sugarcane leaf photo</p>
+      <p style="font-size:0.75rem;margin-top:4px;color:#999">JPG, PNG, WEBP supported</p>
     </label>
+    <div id="file-name-display"></div>
     <img id="preview-img" src="" alt="Preview">
   </div>
+
   <div class="card">
-    <h2>🌡️ Field &amp; Soil Data</h2>
+    <h2>&#127777; Field &amp; Soil Data</h2>
     <div class="grid-3" style="margin-bottom:16px">
-      <div><label>Temperature (°C)</label><input type="number" id="temp" value="28" min="0" max="50"></div>
-      <div><label>Humidity (%)</label><input type="number" id="humidity" value="82" min="0" max="100"></div>
-      <div><label>Moisture (%)</label><input type="number" id="moisture" value="44" min="0" max="100"></div>
+      <div><label class="field">Temperature (C)</label><input type="number" id="temp" value="28" min="0" max="50"></div>
+      <div><label class="field">Humidity (%)</label><input type="number" id="humidity" value="82" min="0" max="100"></div>
+      <div><label class="field">Moisture (%)</label><input type="number" id="moisture" value="44" min="0" max="100"></div>
     </div>
     <div class="grid-3" style="margin-bottom:16px">
-      <div><label>Nitrogen (kg/ha)</label><input type="number" id="nitrogen" value="70" min="0" max="200"></div>
-      <div><label>Potassium (kg/ha)</label><input type="number" id="potassium" value="45" min="0" max="200"></div>
-      <div><label>Phosphorous (kg/ha)</label><input type="number" id="phosphorous" value="38" min="0" max="200"></div>
+      <div><label class="field">Nitrogen (kg/ha)</label><input type="number" id="nitrogen" value="70" min="0" max="200"></div>
+      <div><label class="field">Potassium (kg/ha)</label><input type="number" id="potassium" value="45" min="0" max="200"></div>
+      <div><label class="field">Phosphorous (kg/ha)</label><input type="number" id="phosphorous" value="38" min="0" max="200"></div>
     </div>
     <div class="grid-2">
       <div>
-        <label>Soil Type</label>
-        <select id="soil-type"><option>Loamy</option><option>Clayey</option><option>Sandy</option><option>Red</option><option>Black</option></select>
+        <label class="field">Soil Type</label>
+        <select id="soil-type">
+          <option>Loamy</option><option>Clayey</option><option>Sandy</option><option>Red</option><option>Black</option>
+        </select>
       </div>
       <div>
-        <label>Crop Type</label>
-        <select id="crop-type"><option>Sugarcane</option><option>Maize</option><option>Wheat</option><option>Rice</option><option>Cotton</option></select>
+        <label class="field">Crop Type</label>
+        <select id="crop-type">
+          <option>Sugarcane</option><option>Maize</option><option>Wheat</option><option>Rice</option><option>Cotton</option>
+        </select>
       </div>
     </div>
   </div>
-  <button class="btn-predict" id="predict-btn" onclick="runPrediction()">🔍 Analyze &amp; Recommend</button>
+
+  <button class="btn-predict" id="predict-btn" onclick="runPrediction()">&#128269; Analyze &amp; Recommend</button>
+
   <div class="spinner" id="spinner"></div>
   <div class="status-msg" id="status-msg"></div>
   <div class="error-msg" id="error-msg"></div>
+
   <div id="result-section">
     <div class="card">
-      <h2>🦠 Disease Prediction</h2>
+      <h2>&#129440; Disease Prediction</h2>
       <div class="disease-badge" id="disease-name"></div>
       <div class="confidence-bar-wrap">
         <span>Confidence: <strong id="confidence-pct"></strong></span>
@@ -536,45 +554,54 @@ HTML_PAGE = """<!DOCTYPE html>
       <div id="disease-probs"></div>
     </div>
     <div class="card">
-      <h2>🌱 Fertilizer Recommendations</h2>
+      <h2>&#127807; Fertilizer Recommendations</h2>
       <div id="fert-list"></div>
     </div>
     <div class="card">
-      <h2>🔬 Pesticide &amp; Management Advisory</h2>
+      <h2>&#128300; Pesticide &amp; Management Advisory</h2>
       <ul class="advisory-list" id="advisory-list"></ul>
     </div>
-    <div class="card" id="gradcam-card" style="display:none">
-      <h2>🔍 AI Explanation (Grad-CAM)</h2>
-      <img id="gradcam-img" src="" alt="Grad-CAM" style="display:block;">
+    <div class="card" id="gradcam-card">
+      <h2>&#128269; AI Explanation (Grad-CAM)</h2>
+      <p style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Heatmap shows which leaf regions influenced the prediction.</p>
+      <img id="gradcam-img" src="" alt="Grad-CAM">
     </div>
   </div>
 </div>
-<script>
-let selectedFile = null;
-let pollInterval = null;
 
-function handleFileSelect(input) {
-  const file = input.files[0];
-  if (!file) return;
-  selectedFile = file;
-  const reader = new FileReader();
-  reader.onload = e => {
-    const img = document.getElementById('preview-img');
-    img.src = e.target.result;
-    img.style.display = 'block';
-  };
-  reader.readAsDataURL(file);
-}
+<script>
+var selectedFile = null;
+var pollInterval = null;
+
+// File input change handler — attached via addEventListener, not onchange attr
+document.addEventListener('DOMContentLoaded', function() {
+  var fileInput = document.getElementById('file-input');
+  fileInput.addEventListener('change', function() {
+    if (this.files && this.files.length > 0) {
+      selectedFile = this.files[0];
+      var nameDiv = document.getElementById('file-name-display');
+      nameDiv.textContent = 'Selected: ' + selectedFile.name;
+      nameDiv.style.display = 'block';
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        var img = document.getElementById('preview-img');
+        img.src = e.target.result;
+        img.style.display = 'block';
+      };
+      reader.readAsDataURL(selectedFile);
+    }
+  });
+});
 
 function setStatus(msg) {
-  const el = document.getElementById('status-msg');
+  var el = document.getElementById('status-msg');
   el.textContent = msg;
   el.style.display = msg ? 'block' : 'none';
 }
 
 function showError(msg) {
-  const el = document.getElementById('error-msg');
-  el.textContent = '⚠️ ' + msg;
+  var el = document.getElementById('error-msg');
+  el.textContent = String.fromCharCode(9888) + ' ' + msg;
   el.style.display = 'block';
   setStatus('');
 }
@@ -582,162 +609,167 @@ function showError(msg) {
 function resetUI() {
   document.getElementById('spinner').style.display = 'none';
   document.getElementById('predict-btn').disabled = false;
-  document.getElementById('predict-btn').textContent = '🔍 Analyze & Recommend';
+  document.getElementById('predict-btn').textContent = String.fromCharCode(128269) + ' Analyze & Recommend';
   setStatus('');
   if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
 }
 
-async function runPrediction() {
-  if (!selectedFile) { showError('Please upload a leaf image first.'); return; }
+function runPrediction() {
+  if (!selectedFile) {
+    showError('Please select a leaf image first by clicking the green upload area.');
+    return;
+  }
 
   document.getElementById('predict-btn').disabled = true;
   document.getElementById('predict-btn').textContent = 'Submitting...';
   document.getElementById('spinner').style.display = 'block';
   document.getElementById('error-msg').style.display = 'none';
   document.getElementById('result-section').style.display = 'none';
-  setStatus('Uploading image and submitting job...');
+  setStatus('Uploading image...');
 
-  try {
-    const formData = new FormData();
-    formData.append('image', selectedFile);
-    formData.append('Temparature', document.getElementById('temp').value);
-    formData.append('Humidity', document.getElementById('humidity').value);
-    formData.append('Moisture', document.getElementById('moisture').value);
-    formData.append('Nitrogen', document.getElementById('nitrogen').value);
-    formData.append('Potassium', document.getElementById('potassium').value);
-    formData.append('Phosphorous', document.getElementById('phosphorous').value);
-    formData.append('Soil Type', document.getElementById('soil-type').value);
-    formData.append('Crop Type', document.getElementById('crop-type').value);
+  var formData = new FormData();
+  formData.append('image', selectedFile);
+  formData.append('Temparature', document.getElementById('temp').value);
+  formData.append('Humidity', document.getElementById('humidity').value);
+  formData.append('Moisture', document.getElementById('moisture').value);
+  formData.append('Nitrogen', document.getElementById('nitrogen').value);
+  formData.append('Potassium', document.getElementById('potassium').value);
+  formData.append('Phosphorous', document.getElementById('phosphorous').value);
+  formData.append('Soil Type', document.getElementById('soil-type').value);
+  formData.append('Crop Type', document.getElementById('crop-type').value);
 
-    const submitResp = await fetch('/submit', { method: 'POST', body: formData });
-    const submitData = await submitResp.json();
-
-    if (!submitResp.ok || submitData.error) {
-      showError(submitData.error || 'Failed to submit job');
+  fetch('/submit', { method: 'POST', body: formData })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { showError(data.error); resetUI(); return; }
+      var jobId = data.job_id;
+      var elapsed = 0;
+      document.getElementById('predict-btn').textContent = 'Analyzing...';
+      setStatus('AI is analyzing your image... please wait.');
+      pollInterval = setInterval(function() {
+        elapsed += 3;
+        setStatus('AI is analyzing... (' + elapsed + 's elapsed)');
+        fetch('/result/' + jobId)
+          .then(function(r) { return r.json(); })
+          .then(function(poll) {
+            if (poll.status === 'done') {
+              clearInterval(pollInterval); pollInterval = null;
+              resetUI();
+              if (poll.error) { showError(poll.error); }
+              else { renderResults(poll.result); }
+            } else if (poll.status === 'error') {
+              clearInterval(pollInterval); pollInterval = null;
+              resetUI();
+              showError(poll.error || 'Analysis failed. Please try again.');
+            }
+          })
+          .catch(function() {}); // network blip — keep polling
+      }, 3000);
+    })
+    .catch(function(e) {
+      showError('Network error: ' + e.message);
       resetUI();
-      return;
-    }
-
-    const jobId = submitData.job_id;
-    document.getElementById('predict-btn').textContent = 'Analyzing...';
-    setStatus('Running AI analysis... this may take 30–90 seconds on first run.');
-
-    let elapsed = 0;
-    pollInterval = setInterval(async () => {
-      elapsed += 3;
-      setStatus(`Running AI analysis... (${elapsed}s elapsed, please wait)`);
-      try {
-        const pollResp = await fetch(`/result/${jobId}`);
-        const pollData = await pollResp.json();
-
-        if (pollData.status === 'done') {
-          clearInterval(pollInterval); pollInterval = null;
-          resetUI();
-          if (pollData.error) { showError(pollData.error + (pollData.traceback ? '\n\n' + pollData.traceback : '')); }
-          else { renderResults(pollData.result); }
-        } else if (pollData.status === 'error') {
-          clearInterval(pollInterval); pollInterval = null;
-          resetUI();
-          showError(pollData.error || 'Unknown error during analysis');
-        }
-        // status === 'pending' → keep polling
-      } catch(e) {
-        // network blip — keep polling
-      }
-    }, 3000);
-
-  } catch(e) {
-    showError('Network error: ' + e.message);
-    resetUI();
-  }
+    });
 }
 
 function renderResults(data) {
   document.getElementById('result-section').style.display = 'block';
   document.getElementById('disease-name').textContent = data.predicted_disease;
-  const conf = (data.confidence * 100).toFixed(1);
+  var conf = (data.confidence * 100).toFixed(1);
   document.getElementById('confidence-pct').textContent = conf + '%';
   document.getElementById('conf-bar').style.width = conf + '%';
   document.getElementById('alpha-info').textContent =
-    `Fusion: ${(data.fusion_alpha*100).toFixed(0)}% image weight, ${((1-data.fusion_alpha)*100).toFixed(0)}% sensor weight`;
-  const probsDiv = document.getElementById('disease-probs');
+    'Fusion: ' + (data.fusion_alpha * 100).toFixed(0) + '% image weight, ' +
+    ((1 - data.fusion_alpha) * 100).toFixed(0) + '% sensor weight (confidence-adaptive)';
+
+  var probsDiv = document.getElementById('disease-probs');
   probsDiv.innerHTML = '';
-  Object.entries(data.fused_disease_probs).sort((a,b)=>b[1]-a[1]).forEach(([name,prob]) => {
-    const pct = (prob*100).toFixed(1);
-    probsDiv.innerHTML += `<div class="prob-row"><span class="prob-label">${name}</span><span class="prob-val">${pct}%</span></div><div class="prob-mini-bar" style="width:${pct}%;max-width:100%"></div>`;
+  var sorted = Object.entries(data.fused_disease_probs).sort(function(a,b){return b[1]-a[1];});
+  sorted.forEach(function(item) {
+    var pct = (item[1] * 100).toFixed(1);
+    probsDiv.innerHTML += '<div class="prob-row"><span class="prob-label">' + item[0] +
+      '</span><span class="prob-val">' + pct + '%</span></div>' +
+      '<div class="prob-mini-bar" style="width:' + pct + '%;max-width:100%"></div>';
   });
-  const fertDiv = document.getElementById('fert-list');
+
+  var fertDiv = document.getElementById('fert-list');
   fertDiv.innerHTML = '';
-  Object.entries(data.fertilizer_recommendations).slice(0,5).forEach(([name,prob],i) => {
-    fertDiv.innerHTML += `<div class="fert-card"><span class="fert-rank">${i+1}</span><span class="fert-name">${name}</span><span class="fert-prob">${(prob*100).toFixed(1)}%</span></div>`;
+  var fertItems = Object.entries(data.fertilizer_recommendations);
+  fertItems.slice(0, 5).forEach(function(item, i) {
+    fertDiv.innerHTML += '<div class="fert-card"><span class="fert-rank">' + (i+1) +
+      '</span><span class="fert-name">' + item[0] +
+      '</span><span class="fert-prob">' + (item[1]*100).toFixed(1) + '%</span></div>';
   });
-  const advList = document.getElementById('advisory-list');
+
+  var advList = document.getElementById('advisory-list');
   advList.innerHTML = '';
-  data.pesticide_advisory.forEach(item => { advList.innerHTML += `<li>${item}</li>`; });
+  data.pesticide_advisory.forEach(function(item) {
+    advList.innerHTML += '<li>' + item + '</li>';
+  });
+
   if (data.gradcam_base64) {
     document.getElementById('gradcam-card').style.display = 'block';
     document.getElementById('gradcam-img').src = 'data:image/png;base64,' + data.gradcam_base64;
   }
+
   document.getElementById('result-section').scrollIntoView({ behavior: 'smooth' });
 }
 </script>
 </body>
 </html>"""
 
+
 # ============================================================
-# JOB QUEUE — async prediction so Render proxy never times out
+# JOB QUEUE — async so Render's 30s proxy timeout never triggers
 # ============================================================
 import threading
 import uuid
+import traceback as _tb
 
-_jobs = {}         # job_id -> {"status": "pending"/"done"/"error", "result": ..., "error": ...}
+_jobs = {}
 _jobs_lock = threading.Lock()
 
 def _run_job(job_id, image_bytes, image_suffix, env_input):
     tmp_path = None
     try:
-        import tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=image_suffix) as tmp:
             tmp.write(image_bytes)
             tmp_path = tmp.name
 
-        img_probs    = predict_image_disease_probs(tmp_path)
-        env_df       = preprocess_env_input(env_input)
-        env_probs    = predict_env_disease_probs(env_df)
-        fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
-        fert_probs   = predict_final_recommendations(env_df, fused)
-
-        predicted_disease = max(fused, key=fused.get)
-        gradcam_b64       = generate_gradcam_base64(tmp_path)
+        img_probs     = predict_image_disease_probs(tmp_path)
+        env_df        = preprocess_env_input(env_input)
+        env_probs     = predict_env_disease_probs(env_df)
+        fused, alpha  = fuse_disease_probabilities(img_probs, env_probs)
+        fert_probs    = predict_final_recommendations(env_df, fused)
+        predicted     = max(fused, key=fused.get)
+        gradcam_b64   = generate_gradcam_base64(tmp_path)
 
         result = {
-            "predicted_disease":         str(predicted_disease),
-            "confidence":                float(fused[predicted_disease]),
-            "fusion_alpha":              float(alpha),
-            "image_disease_probs":       {k: float(v) for k, v in img_probs.items()},
-            "environment_disease_probs": {k: float(v) for k, v in env_probs.items()},
-            "fused_disease_probs":       {k: float(v) for k, v in fused.items()},
-            "fertilizer_recommendations":{k: float(v) for k, v in fert_probs.items()},
-            "top_fertilizer":            str(max(fert_probs, key=fert_probs.get)),
-            "pesticide_advisory":        [str(x) for x in PESTICIDE_ADVISORY.get(predicted_disease, [])],
-            "gradcam_base64":            gradcam_b64,
+            "predicted_disease":          str(predicted),
+            "confidence":                 float(fused[predicted]),
+            "fusion_alpha":               float(alpha),
+            "image_disease_probs":        {k: float(v) for k, v in img_probs.items()},
+            "environment_disease_probs":  {k: float(v) for k, v in env_probs.items()},
+            "fused_disease_probs":        {k: float(v) for k, v in fused.items()},
+            "fertilizer_recommendations": {k: float(v) for k, v in fert_probs.items()},
+            "top_fertilizer":             str(max(fert_probs, key=fert_probs.get)),
+            "pesticide_advisory":         [str(x) for x in PESTICIDE_ADVISORY.get(predicted, [])],
+            "gradcam_base64":             gradcam_b64,
         }
         with _jobs_lock:
             _jobs[job_id] = {"status": "done", "result": to_python(result)}
 
     except Exception as e:
-        import traceback
         with _jobs_lock:
-            _jobs[job_id] = {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+            _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-# ============================================================
-# STARTUP — blocking load before routes register
-# ============================================================
-import traceback as _tb
 
+# ============================================================
+# STARTUP — blocking load before workers fork (--preload)
+# ============================================================
 MODELS_READY = False
 MODELS_ERROR = None
 
@@ -747,7 +779,8 @@ try:
     print("[STARTUP] Models ready — app fully operational.")
 except Exception as _e:
     MODELS_ERROR = _tb.format_exc()
-    print(f"[STARTUP ERROR] {_e}")
+    print("[STARTUP ERROR]", _e)
+
 
 # ============================================================
 # FLASK ROUTES
@@ -765,74 +798,73 @@ LOADING_PAGE = """<!DOCTYPE html>
 </style></head>
 <body><div class="box">
   <div class="spinner"></div>
-  <h2>🌿 SugarCane AI is starting up...</h2>
-  <p>Downloading AI models. This takes <strong>1–3 minutes</strong> on first launch.</p>
+  <h2>SugarCane AI is starting up...</h2>
+  <p>Downloading AI models. This takes <strong>1-3 minutes</strong> on first launch.</p>
   <p style="margin-top:12px;font-size:0.85rem;color:#aaa">Page refreshes automatically every 8 seconds.</p>
 </div></body></html>"""
+
 
 @app.route("/")
 def index():
     if MODELS_ERROR:
-        return f"<h2>Startup Error</h2><pre>{MODELS_ERROR}</pre>", 500
+        return "<h2>Startup Error</h2><pre>" + MODELS_ERROR + "</pre>", 500
     if not MODELS_READY:
         return LOADING_PAGE, 200
     return HTML_PAGE
+
 
 @app.route("/health")
 def health():
     if MODELS_READY:
         return "OK", 200
     if MODELS_ERROR:
-        return f"ERROR: {MODELS_ERROR}", 500
+        return "ERROR: " + MODELS_ERROR, 500
     return "Loading...", 200
+
 
 @app.route("/submit", methods=["POST"])
 def submit():
-    """Accept image + form data, start background job, return job_id immediately."""
     if MODELS_ERROR:
-        return jsonify({"error": f"Model load failed: {MODELS_ERROR}"}), 500
+        return jsonify({"error": "Model load failed: " + MODELS_ERROR}), 500
     if not MODELS_READY:
-        return jsonify({"error": "Models still loading — please wait a minute and retry."}), 503
-
+        return jsonify({"error": "Models still loading — please wait and retry."}), 503
     if "image" not in request.files:
-        return jsonify({"error": "No image file uploaded"}), 400
+        return jsonify({"error": "No image file received"}), 400
     image_file = request.files["image"]
-    if image_file.filename == "":
+    if not image_file or image_file.filename == "":
         return jsonify({"error": "Empty filename"}), 400
 
     image_bytes  = image_file.read()
-    image_suffix = os.path.splitext(image_file.filename)[-1] or ".jpg"
+    image_suffix = os.path.splitext(image_file.filename)[-1].lower() or ".jpg"
 
     env_input = {
         "Temparature": float(request.form.get("Temparature", 28)),
-        "Humidity":    float(request.form.get("Humidity", 70)),
-        "Moisture":    float(request.form.get("Moisture", 40)),
-        "Nitrogen":    float(request.form.get("Nitrogen", 50)),
-        "Potassium":   float(request.form.get("Potassium", 40)),
+        "Humidity":    float(request.form.get("Humidity",    70)),
+        "Moisture":    float(request.form.get("Moisture",    40)),
+        "Nitrogen":    float(request.form.get("Nitrogen",    50)),
+        "Potassium":   float(request.form.get("Potassium",   40)),
         "Phosphorous": float(request.form.get("Phosphorous", 30)),
-        "Soil Type":   request.form.get("Soil Type", "Loamy"),
-        "Crop Type":   request.form.get("Crop Type", "Sugarcane"),
+        "Soil Type":   request.form.get("Soil Type",  "Loamy"),
+        "Crop Type":   request.form.get("Crop Type",  "Sugarcane"),
     }
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending"}
-
-    t = threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True)
-    t.start()
-
+    threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
     return jsonify({"job_id": job_id})
+
 
 @app.route("/result/<job_id>")
 def result(job_id):
-    """Poll for job result."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if job is None:
         return jsonify({"status": "error", "error": "Unknown job ID"}), 404
     return jsonify(job)
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"[INFO] Starting server on http://0.0.0.0:{port}")
+    print("[INFO] Starting server on http://0.0.0.0:" + str(port))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
