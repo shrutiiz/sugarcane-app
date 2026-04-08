@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm_module
-import gdown
+import requests
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,11 +29,7 @@ from flask_cors import CORS
 # ============================================================
 # CONFIG
 # ============================================================
-try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-except:
-    BASE_DIR = os.getcwd()
-
+BASE_DIR = os.getcwd()
 ARTIFACT_DIR = os.path.join(BASE_DIR, "artifacts")
 ARTIFACT_ZIP_PATH = os.path.join(BASE_DIR, "artifacts.zip")
 
@@ -122,6 +118,9 @@ MODELS = {}
 # ============================================================
 
 def download_file_from_drive(file_id, destination):
+    import gdown
+    import os
+
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, destination, quiet=False, fuzzy=True)
 
@@ -148,12 +147,10 @@ def ensure_artifacts_downloaded():
     print("[DEBUG] Downloaded file path:", ARTIFACT_ZIP_PATH)
     print("[DEBUG] Downloaded file size:", os.path.getsize(ARTIFACT_ZIP_PATH))
 
-    print("[INFO] Extracting artifacts.zip ...")
     with zipfile.ZipFile(ARTIFACT_ZIP_PATH, "r") as zip_ref:
         zip_ref.extractall(BASE_DIR)
 
     print("[INFO] Artifacts extracted successfully.")
-
 # ============================================================
 # HELPERS
 # ============================================================
@@ -354,7 +351,69 @@ def predict_final_recommendations(env_df, fused_disease_probs):
 # ============================================================
 
 def generate_gradcam_base64(image_path):
-    return None
+    try:
+        cnn = MODELS["cnn"]
+
+        img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+        img_arr = tf.keras.utils.img_to_array(img)
+        img_proc = tf.keras.applications.efficientnet.preprocess_input(
+            np.expand_dims(img_arr.copy(), axis=0).astype(np.float32)
+        )
+        img_tensor = tf.convert_to_tensor(img_proc, dtype=tf.float32)
+
+        base_model = None
+        for layer in cnn.layers:
+            if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower():
+                base_model = layer
+                break
+
+        if base_model is None:
+            return None
+
+        target_layer = base_model.get_layer("top_conv")
+
+        grad_model = tf.keras.Model(
+            inputs=cnn.inputs,
+            outputs=[target_layer.output, cnn.output]
+        )
+
+        with tf.GradientTape() as tape:
+            conv_out, preds = grad_model(img_tensor, training=False)
+            pred_idx = tf.argmax(preds[0])
+            class_ch = preds[:, pred_idx]
+
+        grads = tape.gradient(class_ch, conv_out)
+        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
+
+        heatmap = np.maximum(heatmap, 0)
+        heatmap /= (heatmap.max() + 1e-8)
+
+        heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
+        colormap = cm_module.get_cmap("jet")
+        heatmap_c = colormap(heatmap_r)[:, :, :3]
+        overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * heatmap_c, 0, 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(img_arr.astype(np.uint8))
+        axes[0].set_title("Input Leaf")
+        axes[0].axis("off")
+
+        axes[1].imshow(overlay)
+        axes[1].set_title("Grad-CAM")
+        axes[1].axis("off")
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+
+        return base64.b64encode(buf.read()).decode("utf-8")
+
+    except Exception as e:
+        print(f"[WARN] Grad-CAM failed: {e}")
+        return None
 
 # ============================================================
 # FLASK APP
@@ -363,7 +422,6 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# HTML PAGE
 # ============================================================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -503,7 +561,7 @@ HTML_PAGE = """<!DOCTYPE html>
     animation: spin 0.8s linear infinite; margin: 20px auto;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; white-space: pre-wrap; }
+  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; }
   @media (max-width: 600px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -637,29 +695,9 @@ async function runPrediction() {
     formData.append('Crop Type', document.getElementById('crop-type').value);
 
     const resp = await fetch('/predict', { method: 'POST', body: formData });
+    const data = await resp.json();
 
-    const rawText = await resp.text();
-    let data = null;
-
-    try {
-      data = JSON.parse(rawText);
-    } catch (e) {
-      showError('Server returned non-JSON response. Check Render logs.\n\n' + rawText.slice(0, 500));
-      return;
-    }
-
-    if (!resp.ok) {
-      showError(data.error || 'Server error');
-      console.error(data.traceback || data);
-      return;
-    }
-
-    if (data.error) {
-      showError(data.error);
-      console.error(data.traceback || data);
-      return;
-    }
-
+    if (data.error) { showError(data.error); return; }
     renderResults(data);
   } catch(e) {
     showError('Network error: ' + e.message);
@@ -733,12 +771,78 @@ function showError(msg) {
 # FLASK ROUTES
 # ============================================================
 
+
+# ============================================================
+# STARTUP — background thread so port opens immediately
+# ============================================================
+import threading
+
+MODELS_READY = False
+MODELS_ERROR = None
+
+def load_models_background():
+    global MODELS_READY, MODELS_ERROR
+    try:
+        load_all_models()
+        MODELS_READY = True
+        print("[STARTUP] Models ready — app fully operational.")
+    except Exception as e:
+        import traceback
+        MODELS_ERROR = traceback.format_exc()
+        print(f"[STARTUP ERROR] {e}")
+
+threading.Thread(target=load_models_background, daemon=True).start()
+
+# ============================================================
+# FLASK ROUTES
+# ============================================================
+
+LOADING_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
+<title>SugarCane AI — Starting up...</title>
+<style>
+  body{font-family:sans-serif;background:#fefae0;display:flex;align-items:center;
+       justify-content:center;min-height:100vh;margin:0;}
+  .box{text-align:center;background:white;padding:40px 60px;border-radius:16px;
+       box-shadow:0 4px 20px rgba(0,0,0,0.1);}
+  h2{color:#2d6a4f;margin-bottom:12px;}
+  p{color:#5c5c6e;font-size:0.95rem;}
+  .spinner{width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#52b788;
+           border-radius:50%;animation:spin 0.9s linear infinite;margin:20px auto;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+</style></head>
+<body><div class="box">
+  <div class="spinner"></div>
+  <h2>🌿 SugarCane AI is starting up...</h2>
+  <p>Downloading AI models from Google Drive.<br>
+     This takes <strong>1–3 minutes</strong> on first launch.</p>
+  <p style="margin-top:12px;font-size:0.85rem;color:#aaa">
+     This page refreshes automatically every 10 seconds.</p>
+</div></body></html>"""
+
 @app.route("/")
 def index():
+    if MODELS_ERROR:
+        return f"<h2>Startup Error</h2><pre>{MODELS_ERROR}</pre>", 500
+    if not MODELS_READY:
+        return LOADING_PAGE, 200
     return HTML_PAGE
+
+@app.route("/health")
+def health():
+    if MODELS_READY:
+        return "OK", 200
+    if MODELS_ERROR:
+        return f"ERROR: {MODELS_ERROR}", 500
+    return "Loading...", 200
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    if MODELS_ERROR:
+        return jsonify({"error": f"Model load failed: {MODELS_ERROR}"}), 500
+    if not MODELS_READY:
+        return jsonify({"error": "Models are still loading. Please wait 1–2 minutes and try again."}), 503
+
     tmp_path = None
     try:
         if "image" not in request.files:
@@ -753,73 +857,50 @@ def predict():
             image_file.save(tmp.name)
             tmp_path = tmp.name
 
-        print("[DEBUG] Temp image saved:", tmp_path)
-
         env_input = {
-            "Temparature": float(request.form.get("Temparature", 28)),
-            "Humidity": float(request.form.get("Humidity", 70)),
-            "Moisture": float(request.form.get("Moisture", 40)),
-            "Nitrogen": float(request.form.get("Nitrogen", 50)),
-            "Potassium": float(request.form.get("Potassium", 40)),
-            "Phosphorous": float(request.form.get("Phosphorous", 30)),
-            "Soil Type": request.form.get("Soil Type", "Loamy"),
-            "Crop Type": request.form.get("Crop Type", "Sugarcane"),
+            "Temparature":  float(request.form.get("Temparature", 28)),
+            "Humidity":     float(request.form.get("Humidity", 70)),
+            "Moisture":     float(request.form.get("Moisture", 40)),
+            "Nitrogen":     float(request.form.get("Nitrogen", 50)),
+            "Potassium":    float(request.form.get("Potassium", 40)),
+            "Phosphorous":  float(request.form.get("Phosphorous", 30)),
+            "Soil Type":    request.form.get("Soil Type", "Loamy"),
+            "Crop Type":    request.form.get("Crop Type", "Sugarcane"),
         }
 
-        img_probs = predict_image_disease_probs(tmp_path)
-        print("[DEBUG] Image probs:", img_probs)
-
-        env_df = preprocess_env_input(env_input)
-        print("[DEBUG] Env DF prepared")
-
-        env_probs = predict_env_disease_probs(env_df)
-        print("[DEBUG] Env probs:", env_probs)
-
+        img_probs   = predict_image_disease_probs(tmp_path)
+        env_df      = preprocess_env_input(env_input)
+        env_probs   = predict_env_disease_probs(env_df)
         fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
-        print("[DEBUG] Fused probs:", fused)
-
-        fert_probs = predict_final_recommendations(env_df, fused)
-        print("[DEBUG] Fert probs:", fert_probs)
+        fert_probs  = predict_final_recommendations(env_df, fused)
 
         predicted_disease = max(fused, key=fused.get)
-        confidence = fused[predicted_disease]
-        gradcam_b64 = None
+        confidence        = fused[predicted_disease]
+        gradcam_b64       = generate_gradcam_base64(tmp_path)
 
         response = {
-            "predicted_disease": str(predicted_disease),
-            "confidence": float(confidence),
-            "fusion_alpha": float(alpha),
-            "image_disease_probs": {k: float(v) for k, v in img_probs.items()},
-            "environment_disease_probs": {k: float(v) for k, v in env_probs.items()},
-            "fused_disease_probs": {k: float(v) for k, v in fused.items()},
-            "fertilizer_recommendations": {k: float(v) for k, v in fert_probs.items()},
-            "top_fertilizer": str(max(fert_probs, key=fert_probs.get)),
-            "pesticide_advisory": [str(x) for x in PESTICIDE_ADVISORY.get(predicted_disease, [])],
-            "gradcam_base64": gradcam_b64
+            "predicted_disease":        str(predicted_disease),
+            "confidence":               float(confidence),
+            "fusion_alpha":             float(alpha),
+            "image_disease_probs":      {k: float(v) for k, v in img_probs.items()},
+            "environment_disease_probs":{k: float(v) for k, v in env_probs.items()},
+            "fused_disease_probs":      {k: float(v) for k, v in fused.items()},
+            "fertilizer_recommendations":{k: float(v) for k, v in fert_probs.items()},
+            "top_fertilizer":           str(max(fert_probs, key=fert_probs.get)),
+            "pesticide_advisory":       [str(x) for x in PESTICIDE_ADVISORY.get(predicted_disease, [])],
+            "gradcam_base64":           gradcam_b64,
         }
-
         return jsonify(to_python(response))
 
     except ValueError as e:
-        print("[ERROR] ValueError:", str(e))
         return jsonify({"error": str(e)}), 400
-
     except Exception as e:
-        print("[ERROR] Exception:", traceback.format_exc())
-        return jsonify({
-            "error": f"Internal error: {str(e)}",
-            "traceback": traceback.format_exc()
-        }), 500
-
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-# ============================================================
-# STARTUP
-# ============================================================
-
-load_all_models()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
