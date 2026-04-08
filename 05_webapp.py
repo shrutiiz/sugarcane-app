@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm_module
-import requests
+import gdown
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,7 +29,11 @@ from flask_cors import CORS
 # ============================================================
 # CONFIG
 # ============================================================
-BASE_DIR = os.getcwd()
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except:
+    BASE_DIR = os.getcwd()
+
 ARTIFACT_DIR = os.path.join(BASE_DIR, "artifacts")
 ARTIFACT_ZIP_PATH = os.path.join(BASE_DIR, "artifacts.zip")
 
@@ -118,9 +122,6 @@ MODELS = {}
 # ============================================================
 
 def download_file_from_drive(file_id, destination):
-    import gdown
-    import os
-
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, destination, quiet=False, fuzzy=True)
 
@@ -147,10 +148,12 @@ def ensure_artifacts_downloaded():
     print("[DEBUG] Downloaded file path:", ARTIFACT_ZIP_PATH)
     print("[DEBUG] Downloaded file size:", os.path.getsize(ARTIFACT_ZIP_PATH))
 
+    print("[INFO] Extracting artifacts.zip ...")
     with zipfile.ZipFile(ARTIFACT_ZIP_PATH, "r") as zip_ref:
         zip_ref.extractall(BASE_DIR)
 
     print("[INFO] Artifacts extracted successfully.")
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -351,69 +354,7 @@ def predict_final_recommendations(env_df, fused_disease_probs):
 # ============================================================
 
 def generate_gradcam_base64(image_path):
-    try:
-        cnn = MODELS["cnn"]
-
-        img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
-        img_arr = tf.keras.utils.img_to_array(img)
-        img_proc = tf.keras.applications.efficientnet.preprocess_input(
-            np.expand_dims(img_arr.copy(), axis=0).astype(np.float32)
-        )
-        img_tensor = tf.convert_to_tensor(img_proc, dtype=tf.float32)
-
-        base_model = None
-        for layer in cnn.layers:
-            if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower():
-                base_model = layer
-                break
-
-        if base_model is None:
-            return None
-
-        target_layer = base_model.get_layer("top_conv")
-
-        grad_model = tf.keras.Model(
-            inputs=cnn.inputs,
-            outputs=[target_layer.output, cnn.output]
-        )
-
-        with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(img_tensor, training=False)
-            pred_idx = tf.argmax(preds[0])
-            class_ch = preds[:, pred_idx]
-
-        grads = tape.gradient(class_ch, conv_out)
-        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
-
-        heatmap = np.maximum(heatmap, 0)
-        heatmap /= (heatmap.max() + 1e-8)
-
-        heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
-        colormap = cm_module.get_cmap("jet")
-        heatmap_c = colormap(heatmap_r)[:, :, :3]
-        overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * heatmap_c, 0, 1)
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(img_arr.astype(np.uint8))
-        axes[0].set_title("Input Leaf")
-        axes[0].axis("off")
-
-        axes[1].imshow(overlay)
-        axes[1].set_title("Grad-CAM")
-        axes[1].axis("off")
-
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-
-        return base64.b64encode(buf.read()).decode("utf-8")
-
-    except Exception as e:
-        print(f"[WARN] Grad-CAM failed: {e}")
-        return None
+    return None
 
 # ============================================================
 # FLASK APP
@@ -562,7 +503,7 @@ HTML_PAGE = """<!DOCTYPE html>
     animation: spin 0.8s linear infinite; margin: 20px auto;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; }
+  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; white-space: pre-wrap; }
   @media (max-width: 600px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -696,9 +637,29 @@ async function runPrediction() {
     formData.append('Crop Type', document.getElementById('crop-type').value);
 
     const resp = await fetch('/predict', { method: 'POST', body: formData });
-    const data = await resp.json();
 
-    if (data.error) { showError(data.error); return; }
+    const rawText = await resp.text();
+    let data = null;
+
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      showError('Server returned non-JSON response. Check Render logs.\n\n' + rawText.slice(0, 500));
+      return;
+    }
+
+    if (!resp.ok) {
+      showError(data.error || 'Server error');
+      console.error(data.traceback || data);
+      return;
+    }
+
+    if (data.error) {
+      showError(data.error);
+      console.error(data.traceback || data);
+      return;
+    }
+
     renderResults(data);
   } catch(e) {
     showError('Network error: ' + e.message);
@@ -792,6 +753,8 @@ def predict():
             image_file.save(tmp.name)
             tmp_path = tmp.name
 
+        print("[DEBUG] Temp image saved:", tmp_path)
+
         env_input = {
             "Temparature": float(request.form.get("Temparature", 28)),
             "Humidity": float(request.form.get("Humidity", 70)),
@@ -804,14 +767,23 @@ def predict():
         }
 
         img_probs = predict_image_disease_probs(tmp_path)
+        print("[DEBUG] Image probs:", img_probs)
+
         env_df = preprocess_env_input(env_input)
+        print("[DEBUG] Env DF prepared")
+
         env_probs = predict_env_disease_probs(env_df)
+        print("[DEBUG] Env probs:", env_probs)
+
         fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
+        print("[DEBUG] Fused probs:", fused)
+
         fert_probs = predict_final_recommendations(env_df, fused)
+        print("[DEBUG] Fert probs:", fert_probs)
 
         predicted_disease = max(fused, key=fused.get)
         confidence = fused[predicted_disease]
-        gradcam_b64 = generate_gradcam_base64(tmp_path)
+        gradcam_b64 = None
 
         response = {
             "predicted_disease": str(predicted_disease),
@@ -829,12 +801,16 @@ def predict():
         return jsonify(to_python(response))
 
     except ValueError as e:
+        print("[ERROR] ValueError:", str(e))
         return jsonify({"error": str(e)}), 400
+
     except Exception as e:
+        print("[ERROR] Exception:", traceback.format_exc())
         return jsonify({
             "error": f"Internal error: {str(e)}",
             "traceback": traceback.format_exc()
         }), 500
+
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
