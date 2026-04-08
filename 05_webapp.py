@@ -575,7 +575,7 @@ HTML_PAGE = """<!DOCTYPE html>
     animation: spin 0.8s linear infinite; margin: 20px auto;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; }
+  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; white-space: pre-wrap; }
   @media (max-width: 600px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 </style>
 </head>
