@@ -616,16 +616,14 @@ function resetUI() {
 
 function runPrediction() {
   if (!selectedFile) {
-    showError('Please select a leaf image first by clicking the green upload area.');
+    showError('Please select a leaf image first.');
     return;
   }
 
   document.getElementById('predict-btn').disabled = true;
-  document.getElementById('predict-btn').textContent = 'Submitting...';
+  document.getElementById('predict-btn').textContent = 'Analyzing...';
   document.getElementById('spinner').style.display = 'block';
-  document.getElementById('error-msg').style.display = 'none';
-  document.getElementById('result-section').style.display = 'none';
-  setStatus('Uploading image...');
+  setStatus('AI is processing...');
 
   var formData = new FormData();
   formData.append('image', selectedFile);
@@ -638,35 +636,17 @@ function runPrediction() {
   formData.append('Soil Type', document.getElementById('soil-type').value);
   formData.append('Crop Type', document.getElementById('crop-type').value);
 
-  fetch('/submit', { method: 'POST', body: formData })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) { showError(data.error); resetUI(); return; }
-      var jobId = data.job_id;
-      var elapsed = 0;
-      document.getElementById('predict-btn').textContent = 'Analyzing...';
-      setStatus('AI is analyzing your image... please wait.');
-      pollInterval = setInterval(function() {
-        elapsed += 3;
-        setStatus('AI is analyzing... (' + elapsed + 's elapsed)');
-        fetch('/result/' + jobId)
-          .then(function(r) { return r.json(); })
-          .then(function(poll) {
-            if (poll.status === 'done') {
-              clearInterval(pollInterval); pollInterval = null;
-              resetUI();
-              if (poll.error) { showError(poll.error); }
-              else { renderResults(poll.result); }
-            } else if (poll.status === 'error') {
-              clearInterval(pollInterval); pollInterval = null;
-              resetUI();
-              showError(poll.error || 'Analysis failed. Please try again.');
-            }
-          })
-          .catch(function() {}); // network blip — keep polling
-      }, 3000);
+fetch('/submit', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      resetUI();
+      if (data.status === 'done') {
+        renderResults(data.result);
+      } else {
+        showError(data.error || 'Analysis failed.');
+      }
     })
-    .catch(function(e) {
+    .catch(e => {
       showError('Network error: ' + e.message);
       resetUI();
     });
@@ -821,20 +801,18 @@ def health():
         return "ERROR: " + MODELS_ERROR, 500
     return "Loading...", 200
 
-
 @app.route("/submit", methods=["POST"])
 def submit():
     if MODELS_ERROR:
-        return jsonify({"error": "Model load failed: " + MODELS_ERROR}), 500
+        return jsonify({"error": "Model load failed"}), 500
     if not MODELS_READY:
-        return jsonify({"error": "Models still loading — please wait and retry."}), 503
+        return jsonify({"error": "Models still loading"}), 503
+    
     if "image" not in request.files:
         return jsonify({"error": "No image file received"}), 400
+        
     image_file = request.files["image"]
-    if not image_file or image_file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
-
-    image_bytes  = image_file.read()
+    image_bytes = image_file.read()
     image_suffix = os.path.splitext(image_file.filename)[-1].lower() or ".jpg"
 
     env_input = {
@@ -848,11 +826,39 @@ def submit():
         "Crop Type":   request.form.get("Crop Type",  "Sugarcane"),
     }
 
-    job_id = str(uuid.uuid4())
-    with _jobs_lock:
-        _jobs[job_id] = {"status": "pending"}
-    threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
-    return jsonify({"job_id": job_id})
+    # Instead of a thread, run it directly
+    try:
+        # Create a dummy ID for the function but process immediately
+        job_id = "sync_job" 
+        # Call the logic directly
+        with tempfile.NamedTemporaryFile(delete=False, suffix=image_suffix) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+
+        img_probs     = predict_image_disease_probs(tmp_path)
+        env_df        = preprocess_env_input(env_input)
+        env_probs     = predict_env_disease_probs(env_df)
+        fused, alpha  = fuse_disease_probabilities(img_probs, env_probs)
+        fert_probs    = predict_final_recommendations(env_df, fused)
+        predicted     = max(fused, key=fused.get)
+        gradcam_b64   = generate_gradcam_base64(tmp_path)
+
+        if os.path.exists(tmp_path): os.unlink(tmp_path)
+
+        result = {
+            "predicted_disease":          str(predicted),
+            "confidence":                 float(fused[predicted]),
+            "fusion_alpha":               float(alpha),
+            "fused_disease_probs":        fused,
+            "fertilizer_recommendations": fert_probs,
+            "pesticide_advisory":         PESTICIDE_ADVISORY.get(predicted, []),
+            "gradcam_base64":             gradcam_b64,
+        }
+        
+        # Return the result DIRECTLY, skipping the polling step
+        return jsonify({"status": "done", "result": to_python(result)})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/result/<job_id>")
