@@ -25,9 +25,6 @@ import requests
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-import threading
-PREDICT_LOCK = threading.Lock()
 
 # ============================================================
 # CONFIG
@@ -228,9 +225,6 @@ def build_cnn_model(num_classes):
     return tf.keras.Model(inputs, outputs, name="EfficientNet_AttentionHead")
 
 # ============================================================
-# LOAD ALL MODELS ONCE
-# ============================================================
-
 def load_all_models():
     print("[STARTUP] Loading all models...")
 
@@ -354,7 +348,70 @@ def predict_final_recommendations(env_df, fused_disease_probs):
 # ============================================================
 
 def generate_gradcam_base64(image_path):
-    return None
+    try:
+        cnn = MODELS["cnn"]
+
+        img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+        img_arr = tf.keras.utils.img_to_array(img)
+        img_proc = tf.keras.applications.efficientnet.preprocess_input(
+            np.expand_dims(img_arr.copy(), axis=0).astype(np.float32)
+        )
+        img_tensor = tf.convert_to_tensor(img_proc, dtype=tf.float32)
+
+        base_model = None
+        for layer in cnn.layers:
+            if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower():
+                base_model = layer
+                break
+
+        if base_model is None:
+            return None
+
+        target_layer = base_model.get_layer("top_conv")
+
+        grad_model = tf.keras.Model(
+            inputs=cnn.inputs,
+            outputs=[target_layer.output, cnn.output]
+        )
+
+        with tf.GradientTape() as tape:
+            conv_out, preds = grad_model(img_tensor, training=False)
+            pred_idx = tf.argmax(preds[0])
+            class_ch = preds[:, pred_idx]
+
+        grads = tape.gradient(class_ch, conv_out)
+        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
+
+        heatmap = np.maximum(heatmap, 0)
+        heatmap /= (heatmap.max() + 1e-8)
+
+        heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
+        colormap = cm_module.get_cmap("jet")
+        heatmap_c = colormap(heatmap_r)[:, :, :3]
+        overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * heatmap_c, 0, 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(img_arr.astype(np.uint8))
+        axes[0].set_title("Input Leaf")
+        axes[0].axis("off")
+
+        axes[1].imshow(overlay)
+        axes[1].set_title("Grad-CAM")
+        axes[1].axis("off")
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+
+        return base64.b64encode(buf.read()).decode("utf-8")
+
+    except Exception as e:
+        print(f"[WARN] Grad-CAM failed: {e}")
+        return None
 
 # ============================================================
 # FLASK APP
@@ -362,20 +419,8 @@ def generate_gradcam_base64(image_path):
 app = Flask(__name__)
 CORS(app)
 
-@app.errorhandler(HTTPException)
-def handle_http_exception(e):
-    if request.path.startswith("/predict") or request.path.startswith("/health"):
-        response = e.get_response()
-        response.data = json.dumps({
-            "error": e.name,
-            "code": e.code,
-            "description": e.description
-        })
-        response.content_type = "application/json"
-        return response
-    return e
-
 # ============================================================
+# HTML PAGE
 # ============================================================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -385,138 +430,53 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>SugarCane AI — Disease & Fertilizer Advisor</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --green:    #2d6a4f;
-    --green-lt: #52b788;
-    --cream:    #fefae0;
-    --amber:    #d4a017;
-    --rust:     #bc4749;
-    --text:     #1a1a2e;
-    --muted:    #5c5c6e;
-    --card-bg:  #ffffff;
-    --border:   #e0e0e0;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: 'DM Sans', sans-serif;
-    background: var(--cream);
-    color: var(--text);
-    min-height: 100vh;
-  }
-  header {
-    background: var(--green);
-    color: white;
-    padding: 20px 40px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-  header h1 {
-    font-family: 'DM Serif Display', serif;
-    font-size: 1.8rem;
-    font-weight: 400;
-  }
-  header span { font-size: 2rem; }
-  .subtitle { font-size: 0.85rem; color: rgba(255,255,255,0.75); margin-top: 2px; }
-  .main { max-width: 960px; margin: 0 auto; padding: 32px 20px; }
-  .card {
-    background: var(--card-bg);
-    border-radius: 16px;
-    padding: 28px;
-    margin-bottom: 24px;
-    border: 1px solid var(--border);
-    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-  }
-  .card h2 {
-    font-family: 'DM Serif Display', serif;
-    font-size: 1.3rem;
-    font-weight: 400;
-    color: var(--green);
-    margin-bottom: 20px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
-  label { display: block; font-size: 0.8rem; font-weight: 500; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
-  input, select {
-    width: 100%;
-    padding: 10px 14px;
-    border: 1.5px solid var(--border);
-    border-radius: 10px;
-    font-family: 'DM Sans', sans-serif;
-    font-size: 0.95rem;
-    background: #fafafa;
-    transition: border-color 0.2s;
-  }
-  input:focus, select:focus { outline: none; border-color: var(--green-lt); }
-  .upload-area {
-    border: 2px dashed var(--green-lt);
-    border-radius: 12px;
-    padding: 32px;
-    text-align: center;
-    cursor: pointer;
-    transition: background 0.2s;
-    background: #f7fdf9;
-  }
-  .upload-area:hover { background: #edf7f0; }
-  .upload-area input[type="file"] { display: none; }
-  .upload-area .icon { font-size: 2.5rem; margin-bottom: 8px; }
-  .upload-area p { color: var(--muted); font-size: 0.9rem; }
-  #preview-img {
-    max-width: 100%; border-radius: 10px; margin-top: 14px;
-    display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-  }
-  .btn-predict {
-    width: 100%; padding: 14px; background: var(--green);
-    color: white; border: none; border-radius: 12px;
-    font-family: 'DM Sans', sans-serif; font-size: 1rem;
-    font-weight: 500; cursor: pointer; transition: background 0.2s;
-    margin-top: 4px;
-  }
-  .btn-predict:hover  { background: #245a40; }
-  .btn-predict:disabled { background: #aaa; cursor: not-allowed; }
-  #result-section { display: none; }
-  .disease-badge {
-    display: inline-block; padding: 6px 18px;
-    border-radius: 99px; font-weight: 500; font-size: 1rem;
-    background: var(--green); color: white; margin-bottom: 12px;
-  }
-  .confidence-bar-wrap { margin: 8px 0 18px; }
-  .confidence-bar-wrap span { font-size: 0.8rem; color: var(--muted); }
-  .bar-track { background: #e8f5ec; border-radius: 99px; height: 10px; margin-top: 4px; }
-  .bar-fill  { background: var(--green-lt); height: 100%; border-radius: 99px; transition: width 0.6s ease; }
-  .prob-row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; font-size: 0.9rem; }
-  .prob-label { color: var(--text); }
-  .prob-val   { color: var(--green); font-weight: 500; }
-  .prob-mini-bar { height: 5px; background: var(--green-lt); border-radius: 3px; margin-top: 3px; }
-  .advisory-list { list-style: none; }
-  .advisory-list li {
-    padding: 8px 12px; background: #fff9e6; border-radius: 8px;
-    margin-bottom: 8px; font-size: 0.9rem; border-left: 3px solid var(--amber);
-  }
-  .fert-card {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 12px 16px; background: #f5faf7; border-radius: 10px;
-    margin-bottom: 8px; border: 1px solid #d6ede3;
-  }
-  .fert-name { font-weight: 500; color: var(--green); }
-  .fert-prob { font-size: 0.9rem; color: var(--muted); }
-  .fert-rank { font-size: 1.1rem; font-weight: 600; color: var(--amber); min-width: 26px; }
-  .alpha-info {
-    background: #f0f4ff; border-radius: 8px; padding: 10px 14px;
-    font-size: 0.85rem; color: #3a4a7a; margin-bottom: 16px;
-    border-left: 3px solid #667eea;
-  }
-  #gradcam-img { max-width: 100%; border-radius: 10px; margin-top: 10px; display: none; }
-  .spinner {
-    display: none; width: 36px; height: 36px; border: 4px solid #e0e0e0;
-    border-top-color: var(--green); border-radius: 50%;
-    animation: spin 0.8s linear infinite; margin: 20px auto;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .error-msg { background: #ffeef0; border-left: 3px solid var(--rust); border-radius: 8px; padding: 12px 16px; color: #8b0000; font-size: 0.9rem; display: none; white-space: pre-wrap; }
-  @media (max-width: 600px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  :root{--green:#2d6a4f;--green-lt:#52b788;--cream:#fefae0;--amber:#d4a017;--rust:#bc4749;--text:#1a1a2e;--muted:#5c5c6e;--card-bg:#ffffff;--border:#e0e0e0;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'DM Sans',sans-serif;background:var(--cream);color:var(--text);min-height:100vh;}
+  header{background:var(--green);color:white;padding:20px 40px;display:flex;align-items:center;gap:16px;}
+  header h1{font-family:'DM Serif Display',serif;font-size:1.8rem;font-weight:400;}
+  header span{font-size:2rem;}
+  .subtitle{font-size:0.85rem;color:rgba(255,255,255,0.75);margin-top:2px;}
+  .main{max-width:960px;margin:0 auto;padding:32px 20px;}
+  .card{background:var(--card-bg);border-radius:16px;padding:28px;margin-bottom:24px;border:1px solid var(--border);box-shadow:0 2px 12px rgba(0,0,0,0.06);}
+  .card h2{font-family:'DM Serif Display',serif;font-size:1.3rem;font-weight:400;color:var(--green);margin-bottom:20px;padding-bottom:10px;border-bottom:1px solid var(--border);}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;}
+  label{display:block;font-size:0.8rem;font-weight:500;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.5px;}
+  input,select{width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:0.95rem;background:#fafafa;transition:border-color 0.2s;}
+  input:focus,select:focus{outline:none;border-color:var(--green-lt);}
+  .upload-area{border:2px dashed var(--green-lt);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:background 0.2s;background:#f7fdf9;}
+  .upload-area:hover{background:#edf7f0;}
+  .upload-area input[type="file"]{display:none;}
+  .upload-area .icon{font-size:2.5rem;margin-bottom:8px;}
+  .upload-area p{color:var(--muted);font-size:0.9rem;}
+  #preview-img{max-width:100%;border-radius:10px;margin-top:14px;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.12);}
+  .btn-predict{width:100%;padding:14px;background:var(--green);color:white;border:none;border-radius:12px;font-family:'DM Sans',sans-serif;font-size:1rem;font-weight:500;cursor:pointer;transition:background 0.2s;margin-top:4px;}
+  .btn-predict:hover{background:#245a40;}
+  .btn-predict:disabled{background:#aaa;cursor:not-allowed;}
+  #result-section{display:none;}
+  .disease-badge{display:inline-block;padding:6px 18px;border-radius:99px;font-weight:500;font-size:1rem;background:var(--green);color:white;margin-bottom:12px;}
+  .confidence-bar-wrap{margin:8px 0 18px;}
+  .confidence-bar-wrap span{font-size:0.8rem;color:var(--muted);}
+  .bar-track{background:#e8f5ec;border-radius:99px;height:10px;margin-top:4px;}
+  .bar-fill{background:var(--green-lt);height:100%;border-radius:99px;transition:width 0.6s ease;}
+  .prob-row{display:flex;justify-content:space-between;align-items:center;margin:8px 0;font-size:0.9rem;}
+  .prob-label{color:var(--text);}
+  .prob-val{color:var(--green);font-weight:500;}
+  .prob-mini-bar{height:5px;background:var(--green-lt);border-radius:3px;margin-top:3px;}
+  .advisory-list{list-style:none;}
+  .advisory-list li{padding:8px 12px;background:#fff9e6;border-radius:8px;margin-bottom:8px;font-size:0.9rem;border-left:3px solid var(--amber);}
+  .fert-card{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:#f5faf7;border-radius:10px;margin-bottom:8px;border:1px solid #d6ede3;}
+  .fert-name{font-weight:500;color:var(--green);}
+  .fert-prob{font-size:0.9rem;color:var(--muted);}
+  .fert-rank{font-size:1.1rem;font-weight:600;color:var(--amber);min-width:26px;}
+  .alpha-info{background:#f0f4ff;border-radius:8px;padding:10px 14px;font-size:0.85rem;color:#3a4a7a;margin-bottom:16px;border-left:3px solid #667eea;}
+  #gradcam-img{max-width:100%;border-radius:10px;margin-top:10px;display:none;}
+  .spinner{display:none;width:36px;height:36px;border:4px solid #e0e0e0;border-top-color:var(--green);border-radius:50%;animation:spin 0.8s linear infinite;margin:20px auto;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .status-msg{text-align:center;color:var(--muted);font-size:0.9rem;margin-top:8px;display:none;}
+  .error-msg{background:#ffeef0;border-left:3px solid var(--rust);border-radius:8px;padding:12px 16px;color:#8b0000;font-size:0.9rem;display:none;white-space:pre-wrap;}
+  @media(max-width:600px){.grid-2,.grid-3{grid-template-columns:1fr;}}
 </style>
 </head>
 <body>
@@ -524,12 +484,10 @@ HTML_PAGE = """<!DOCTYPE html>
   <span>🌿</span>
   <div>
     <h1>SugarCane AI Advisor</h1>
-    <div class="subtitle">Multimodal Disease Detection & Fertilizer / Pesticide Recommendation</div>
+    <div class="subtitle">Multimodal Disease Detection &amp; Fertilizer / Pesticide Recommendation</div>
   </div>
 </header>
-
 <div class="main">
-
   <div class="card">
     <h2>📷 Leaf Image</h2>
     <div class="upload-area" onclick="document.getElementById('file-input').click()">
@@ -540,9 +498,8 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <img id="preview-img" src="" alt="Preview">
   </div>
-
   <div class="card">
-    <h2>🌡️ Field & Soil Data</h2>
+    <h2>🌡️ Field &amp; Soil Data</h2>
     <div class="grid-3" style="margin-bottom:16px">
       <div><label>Temperature (°C)</label><input type="number" id="temp" value="28" min="0" max="50"></div>
       <div><label>Humidity (%)</label><input type="number" id="humidity" value="82" min="0" max="100"></div>
@@ -556,31 +513,20 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="grid-2">
       <div>
         <label>Soil Type</label>
-        <select id="soil-type">
-          <option>Loamy</option><option>Clayey</option><option>Sandy</option>
-          <option>Red</option><option>Black</option>
-        </select>
+        <select id="soil-type"><option>Loamy</option><option>Clayey</option><option>Sandy</option><option>Red</option><option>Black</option></select>
       </div>
       <div>
         <label>Crop Type</label>
-        <select id="crop-type">
-          <option>Sugarcane</option><option>Maize</option><option>Wheat</option>
-          <option>Rice</option><option>Cotton</option>
-        </select>
+        <select id="crop-type"><option>Sugarcane</option><option>Maize</option><option>Wheat</option><option>Rice</option><option>Cotton</option></select>
       </div>
     </div>
   </div>
-
-  <button class="btn-predict" id="predict-btn" onclick="runPrediction()">
-    🔍 Analyze & Recommend
-  </button>
-
+  <button class="btn-predict" id="predict-btn" onclick="runPrediction()">🔍 Analyze &amp; Recommend</button>
   <div class="spinner" id="spinner"></div>
+  <div class="status-msg" id="status-msg"></div>
   <div class="error-msg" id="error-msg"></div>
-
   <div id="result-section">
-
-    <div class="card" id="disease-card">
+    <div class="card">
       <h2>🦠 Disease Prediction</h2>
       <div class="disease-badge" id="disease-name"></div>
       <div class="confidence-bar-wrap">
@@ -590,28 +536,23 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="alpha-info" id="alpha-info"></div>
       <div id="disease-probs"></div>
     </div>
-
-    <div class="card" id="fert-card">
+    <div class="card">
       <h2>🌱 Fertilizer Recommendations</h2>
       <div id="fert-list"></div>
     </div>
-
-    <div class="card" id="advisory-card">
-      <h2>🔬 Pesticide & Management Advisory</h2>
+    <div class="card">
+      <h2>🔬 Pesticide &amp; Management Advisory</h2>
       <ul class="advisory-list" id="advisory-list"></ul>
     </div>
-
-    <div class="card" id="gradcam-card">
+    <div class="card" id="gradcam-card" style="display:none">
       <h2>🔍 AI Explanation (Grad-CAM)</h2>
-      <p style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Heatmap shows which leaf regions influenced the prediction.</p>
-      <img id="gradcam-img" src="" alt="Grad-CAM">
+      <img id="gradcam-img" src="" alt="Grad-CAM" style="display:block;">
     </div>
-
   </div>
 </div>
-
 <script>
 let selectedFile = null;
+let pollInterval = null;
 
 function handleFileSelect(input) {
   const file = input.files[0];
@@ -626,15 +567,36 @@ function handleFileSelect(input) {
   reader.readAsDataURL(file);
 }
 
+function setStatus(msg) {
+  const el = document.getElementById('status-msg');
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.textContent = '⚠️ ' + msg;
+  el.style.display = 'block';
+  setStatus('');
+}
+
+function resetUI() {
+  document.getElementById('spinner').style.display = 'none';
+  document.getElementById('predict-btn').disabled = false;
+  document.getElementById('predict-btn').textContent = '🔍 Analyze & Recommend';
+  setStatus('');
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
 async function runPrediction() {
   if (!selectedFile) { showError('Please upload a leaf image first.'); return; }
 
-  const btn = document.getElementById('predict-btn');
-  btn.disabled = true;
-  btn.textContent = 'Analyzing...';
+  document.getElementById('predict-btn').disabled = true;
+  document.getElementById('predict-btn').textContent = 'Submitting...';
   document.getElementById('spinner').style.display = 'block';
   document.getElementById('error-msg').style.display = 'none';
   document.getElementById('result-section').style.display = 'none';
+  setStatus('Uploading image and submitting job...');
 
   try {
     const formData = new FormData();
@@ -648,110 +610,132 @@ async function runPrediction() {
     formData.append('Soil Type', document.getElementById('soil-type').value);
     formData.append('Crop Type', document.getElementById('crop-type').value);
 
-const resp = await fetch('/predict', { method: 'POST', body: formData });
+    const submitResp = await fetch('/submit', { method: 'POST', body: formData });
+    const submitData = await submitResp.json();
 
-const rawText = await resp.text();
-let data = null;
+    if (!submitResp.ok || submitData.error) {
+      showError(submitData.error || 'Failed to submit job');
+      resetUI();
+      return;
+    }
 
-try {
-  data = rawText ? JSON.parse(rawText) : null;
-} catch (e) {
-  showError(
-    `Server returned invalid response.\n` +
-    `HTTP ${resp.status}\n\n` +
-    rawText.slice(0, 800)
-  );
-  return;
-}
+    const jobId = submitData.job_id;
+    document.getElementById('predict-btn').textContent = 'Analyzing...';
+    setStatus('Running AI analysis... this may take 30–90 seconds on first run.');
 
-if (!resp.ok) {
-  showError(data?.error || `Server error (HTTP ${resp.status})`);
-  console.error(data);
-  return;
-}
+    let elapsed = 0;
+    pollInterval = setInterval(async () => {
+      elapsed += 3;
+      setStatus(`Running AI analysis... (${elapsed}s elapsed, please wait)`);
+      try {
+        const pollResp = await fetch(`/result/${jobId}`);
+        const pollData = await pollResp.json();
 
-if (!data) {
-  showError(`Empty response from server (HTTP ${resp.status})`);
-  return;
-}
+        if (pollData.status === 'done') {
+          clearInterval(pollInterval); pollInterval = null;
+          resetUI();
+          if (pollData.error) { showError(pollData.error + (pollData.traceback ? '\n\n' + pollData.traceback : '')); }
+          else { renderResults(pollData.result); }
+        } else if (pollData.status === 'error') {
+          clearInterval(pollInterval); pollInterval = null;
+          resetUI();
+          showError(pollData.error || 'Unknown error during analysis');
+        }
+        // status === 'pending' → keep polling
+      } catch(e) {
+        // network blip — keep polling
+      }
+    }, 3000);
 
-if (data.error) {
-  showError(data.error);
-  return;
-}
-
-renderResults(data);
   } catch(e) {
     showError('Network error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '🔍 Analyze & Recommend';
-    document.getElementById('spinner').style.display = 'none';
+    resetUI();
   }
 }
 
 function renderResults(data) {
   document.getElementById('result-section').style.display = 'block';
-
   document.getElementById('disease-name').textContent = data.predicted_disease;
   const conf = (data.confidence * 100).toFixed(1);
   document.getElementById('confidence-pct').textContent = conf + '%';
   document.getElementById('conf-bar').style.width = conf + '%';
   document.getElementById('alpha-info').textContent =
-    `Fusion: ${(data.fusion_alpha*100).toFixed(0)}% image weight, ${((1-data.fusion_alpha)*100).toFixed(0)}% sensor weight (confidence-adaptive)`;
-
+    `Fusion: ${(data.fusion_alpha*100).toFixed(0)}% image weight, ${((1-data.fusion_alpha)*100).toFixed(0)}% sensor weight`;
   const probsDiv = document.getElementById('disease-probs');
   probsDiv.innerHTML = '';
-  const sortedD = Object.entries(data.fused_disease_probs).sort((a,b)=>b[1]-a[1]);
-  sortedD.forEach(([name, prob]) => {
-    const pct = (prob * 100).toFixed(1);
-    probsDiv.innerHTML += `
-      <div class="prob-row">
-        <span class="prob-label">${name}</span>
-        <span class="prob-val">${pct}%</span>
-      </div>
-      <div class="prob-mini-bar" style="width:${pct}%;max-width:100%"></div>`;
+  Object.entries(data.fused_disease_probs).sort((a,b)=>b[1]-a[1]).forEach(([name,prob]) => {
+    const pct = (prob*100).toFixed(1);
+    probsDiv.innerHTML += `<div class="prob-row"><span class="prob-label">${name}</span><span class="prob-val">${pct}%</span></div><div class="prob-mini-bar" style="width:${pct}%;max-width:100%"></div>`;
   });
-
   const fertDiv = document.getElementById('fert-list');
   fertDiv.innerHTML = '';
-  const fertItems = Object.entries(data.fertilizer_recommendations);
-  fertItems.slice(0, 5).forEach(([name, prob], i) => {
-    fertDiv.innerHTML += `
-      <div class="fert-card">
-        <span class="fert-rank">${i+1}</span>
-        <span class="fert-name">${name}</span>
-        <span class="fert-prob">${(prob*100).toFixed(1)}%</span>
-      </div>`;
+  Object.entries(data.fertilizer_recommendations).slice(0,5).forEach(([name,prob],i) => {
+    fertDiv.innerHTML += `<div class="fert-card"><span class="fert-rank">${i+1}</span><span class="fert-name">${name}</span><span class="fert-prob">${(prob*100).toFixed(1)}%</span></div>`;
   });
-
   const advList = document.getElementById('advisory-list');
   advList.innerHTML = '';
-  data.pesticide_advisory.forEach(item => {
-    advList.innerHTML += `<li>${item}</li>`;
-  });
-
+  data.pesticide_advisory.forEach(item => { advList.innerHTML += `<li>${item}</li>`; });
   if (data.gradcam_base64) {
-    const gc = document.getElementById('gradcam-img');
-    gc.src = 'data:image/png;base64,' + data.gradcam_base64;
-    gc.style.display = 'block';
+    document.getElementById('gradcam-card').style.display = 'block';
+    document.getElementById('gradcam-img').src = 'data:image/png;base64,' + data.gradcam_base64;
   }
-
   document.getElementById('result-section').scrollIntoView({ behavior: 'smooth' });
-}
-
-function showError(msg) {
-  const el = document.getElementById('error-msg');
-  el.textContent = '⚠️ ' + msg;
-  el.style.display = 'block';
 }
 </script>
 </body>
 </html>"""
 
+# ============================================================
+# JOB QUEUE — async prediction so Render proxy never times out
+# ============================================================
+import threading
+import uuid
+
+_jobs = {}         # job_id -> {"status": "pending"/"done"/"error", "result": ..., "error": ...}
+_jobs_lock = threading.Lock()
+
+def _run_job(job_id, image_bytes, image_suffix, env_input):
+    tmp_path = None
+    try:
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False, suffix=image_suffix) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+
+        img_probs    = predict_image_disease_probs(tmp_path)
+        env_df       = preprocess_env_input(env_input)
+        env_probs    = predict_env_disease_probs(env_df)
+        fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
+        fert_probs   = predict_final_recommendations(env_df, fused)
+
+        predicted_disease = max(fused, key=fused.get)
+        gradcam_b64       = generate_gradcam_base64(tmp_path)
+
+        result = {
+            "predicted_disease":         str(predicted_disease),
+            "confidence":                float(fused[predicted_disease]),
+            "fusion_alpha":              float(alpha),
+            "image_disease_probs":       {k: float(v) for k, v in img_probs.items()},
+            "environment_disease_probs": {k: float(v) for k, v in env_probs.items()},
+            "fused_disease_probs":       {k: float(v) for k, v in fused.items()},
+            "fertilizer_recommendations":{k: float(v) for k, v in fert_probs.items()},
+            "top_fertilizer":            str(max(fert_probs, key=fert_probs.get)),
+            "pesticide_advisory":        [str(x) for x in PESTICIDE_ADVISORY.get(predicted_disease, [])],
+            "gradcam_base64":            gradcam_b64,
+        }
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "result": to_python(result)}
+
+    except Exception as e:
+        import traceback
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 # ============================================================
-# STARTUP — load models at import time (works with --preload)
+# STARTUP — blocking load before routes register
 # ============================================================
 import traceback as _tb
 
@@ -771,26 +755,20 @@ except Exception as _e:
 # ============================================================
 
 LOADING_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
+<html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="8">
 <title>SugarCane AI — Starting up...</title>
 <style>
-  body{font-family:sans-serif;background:#fefae0;display:flex;align-items:center;
-       justify-content:center;min-height:100vh;margin:0;}
-  .box{text-align:center;background:white;padding:40px 60px;border-radius:16px;
-       box-shadow:0 4px 20px rgba(0,0,0,0.1);}
-  h2{color:#2d6a4f;margin-bottom:12px;}
-  p{color:#5c5c6e;font-size:0.95rem;}
-  .spinner{width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#52b788;
-           border-radius:50%;animation:spin 0.9s linear infinite;margin:20px auto;}
+  body{font-family:sans-serif;background:#fefae0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+  .box{text-align:center;background:white;padding:40px 60px;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,0.1);}
+  h2{color:#2d6a4f;margin-bottom:12px;}p{color:#5c5c6e;font-size:0.95rem;}
+  .spinner{width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#52b788;border-radius:50%;animation:spin 0.9s linear infinite;margin:20px auto;}
   @keyframes spin{to{transform:rotate(360deg);}}
 </style></head>
 <body><div class="box">
   <div class="spinner"></div>
   <h2>🌿 SugarCane AI is starting up...</h2>
-  <p>Downloading AI models from Google Drive.<br>
-     This takes <strong>1–3 minutes</strong> on first launch.</p>
-  <p style="margin-top:12px;font-size:0.85rem;color:#aaa">
-     This page refreshes automatically every 10 seconds.</p>
+  <p>Downloading AI models. This takes <strong>1–3 minutes</strong> on first launch.</p>
+  <p style="margin-top:12px;font-size:0.85rem;color:#aaa">Page refreshes automatically every 8 seconds.</p>
 </div></body></html>"""
 
 @app.route("/")
@@ -809,72 +787,51 @@ def health():
         return f"ERROR: {MODELS_ERROR}", 500
     return "Loading...", 200
 
-@app.route("/predict", methods=["POST"])
-def predict():
+@app.route("/submit", methods=["POST"])
+def submit():
+    """Accept image + form data, start background job, return job_id immediately."""
     if MODELS_ERROR:
         return jsonify({"error": f"Model load failed: {MODELS_ERROR}"}), 500
     if not MODELS_READY:
-        return jsonify({"error": "Models are still loading. Please wait 1–2 minutes and try again."}), 503
+        return jsonify({"error": "Models still loading — please wait a minute and retry."}), 503
 
-    with PREDICT_LOCK:
-        tmp_path = None
-    try:
-        if "image" not in request.files:
-            return jsonify({"error": "No image file uploaded"}), 400
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+    image_file = request.files["image"]
+    if image_file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
 
-        image_file = request.files["image"]
-        if image_file.filename == "":
-            return jsonify({"error": "Empty filename"}), 400
+    image_bytes  = image_file.read()
+    image_suffix = os.path.splitext(image_file.filename)[-1] or ".jpg"
 
-        suffix = os.path.splitext(image_file.filename)[-1] or ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            image_file.save(tmp.name)
-            tmp_path = tmp.name
+    env_input = {
+        "Temparature": float(request.form.get("Temparature", 28)),
+        "Humidity":    float(request.form.get("Humidity", 70)),
+        "Moisture":    float(request.form.get("Moisture", 40)),
+        "Nitrogen":    float(request.form.get("Nitrogen", 50)),
+        "Potassium":   float(request.form.get("Potassium", 40)),
+        "Phosphorous": float(request.form.get("Phosphorous", 30)),
+        "Soil Type":   request.form.get("Soil Type", "Loamy"),
+        "Crop Type":   request.form.get("Crop Type", "Sugarcane"),
+    }
 
-        env_input = {
-            "Temparature":  float(request.form.get("Temparature", 28)),
-            "Humidity":     float(request.form.get("Humidity", 70)),
-            "Moisture":     float(request.form.get("Moisture", 40)),
-            "Nitrogen":     float(request.form.get("Nitrogen", 50)),
-            "Potassium":    float(request.form.get("Potassium", 40)),
-            "Phosphorous":  float(request.form.get("Phosphorous", 30)),
-            "Soil Type":    request.form.get("Soil Type", "Loamy"),
-            "Crop Type":    request.form.get("Crop Type", "Sugarcane"),
-        }
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending"}
 
-        img_probs   = predict_image_disease_probs(tmp_path)
-        env_df      = preprocess_env_input(env_input)
-        env_probs   = predict_env_disease_probs(env_df)
-        fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
-        fert_probs  = predict_final_recommendations(env_df, fused)
+    t = threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True)
+    t.start()
 
-        predicted_disease = max(fused, key=fused.get)
-        confidence        = fused[predicted_disease]
-        gradcam_b64       = None
+    return jsonify({"job_id": job_id})
 
-        response = {
-            "predicted_disease":        str(predicted_disease),
-            "confidence":               float(confidence),
-            "fusion_alpha":             float(alpha),
-            "image_disease_probs":      {k: float(v) for k, v in img_probs.items()},
-            "environment_disease_probs":{k: float(v) for k, v in env_probs.items()},
-            "fused_disease_probs":      {k: float(v) for k, v in fused.items()},
-            "fertilizer_recommendations":{k: float(v) for k, v in fert_probs.items()},
-            "top_fertilizer":           str(max(fert_probs, key=fert_probs.get)),
-            "pesticide_advisory":       [str(x) for x in PESTICIDE_ADVISORY.get(predicted_disease, [])],
-            "gradcam_base64":           gradcam_b64,
-        }
-        return jsonify(to_python(response))
-
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
+@app.route("/result/<job_id>")
+def result(job_id):
+    """Poll for job result."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return jsonify({"status": "error", "error": "Unknown job ID"}), 404
+    return jsonify(job)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
