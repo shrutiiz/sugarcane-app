@@ -25,6 +25,7 @@ import requests
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 # ============================================================
 # CONFIG
@@ -421,6 +422,19 @@ def generate_gradcam_base64(image_path):
 app = Flask(__name__)
 CORS(app)
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    if request.path.startswith("/predict") or request.path.startswith("/health"):
+        response = e.get_response()
+        response.data = json.dumps({
+            "error": e.name,
+            "code": e.code,
+            "description": e.description
+        })
+        response.content_type = "application/json"
+        return response
+    return e
+
 # ============================================================
 # ============================================================
 HTML_PAGE = """<!DOCTYPE html>
@@ -694,11 +708,39 @@ async function runPrediction() {
     formData.append('Soil Type', document.getElementById('soil-type').value);
     formData.append('Crop Type', document.getElementById('crop-type').value);
 
-    const resp = await fetch('/predict', { method: 'POST', body: formData });
-    const data = await resp.json();
+const resp = await fetch('/predict', { method: 'POST', body: formData });
 
-    if (data.error) { showError(data.error); return; }
-    renderResults(data);
+const rawText = await resp.text();
+let data = null;
+
+try {
+  data = rawText ? JSON.parse(rawText) : null;
+} catch (e) {
+  showError(
+    `Server returned invalid response.\n` +
+    `HTTP ${resp.status}\n\n` +
+    rawText.slice(0, 800)
+  );
+  return;
+}
+
+if (!resp.ok) {
+  showError(data?.error || `Server error (HTTP ${resp.status})`);
+  console.error(data);
+  return;
+}
+
+if (!data) {
+  showError(`Empty response from server (HTTP ${resp.status})`);
+  return;
+}
+
+if (data.error) {
+  showError(data.error);
+  return;
+}
+
+renderResults(data);
   } catch(e) {
     showError('Network error: ' + e.message);
   } finally {
@@ -766,10 +808,6 @@ function showError(msg) {
 </script>
 </body>
 </html>"""
-
-# ============================================================
-# FLASK ROUTES
-# ============================================================
 
 
 # ============================================================
