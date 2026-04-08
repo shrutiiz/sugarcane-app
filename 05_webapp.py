@@ -1,6 +1,3 @@
-!pip install flask flask-cors
-!pip install flask-cors
-!pip install gdown
 """
 CODE 05 — Web Application (Flask — Permanent Deployment)
 =========================================================
