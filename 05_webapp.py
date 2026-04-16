@@ -1,9 +1,11 @@
 """
-CODE 05 - Web Application (Flask - Permanent Deployment)
+CODE 05 - Web Application (Flask - Permanent Deployment on Render)
 Fixes applied:
-  - gdown 6.x compatible download (no fuzzy argument)
-  - Async job queue so Render 30s proxy timeout never triggers
-  - Working file upload via proper label+addEventListener
+  - gdown 6.x compatible download
+  - Async job queue so Render 30-s proxy timeout never triggers
+  - TensorFlow thread-safety: all TF inference on a dedicated single thread
+  - Eager-mode warmup before gunicorn forks
+  - Proper port binding so Render detects the service quickly
 """
 
 import os
@@ -15,11 +17,23 @@ import zipfile
 import shutil
 import traceback as _tb
 import threading
+import queue
 import uuid
+import time
 import numpy as np
 import pandas as pd
 import joblib
+
+# ── Force TF to CPU and suppress noisy logs BEFORE import ──────────
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 import tensorflow as tf
+
+# Force eager mode (no graph compilation surprises)
+tf.config.run_functions_eagerly(True)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -76,8 +90,8 @@ REC_FEATURE_COLS = ENV_FEATURE_COLS + [
 
 PESTICIDE_ADVISORY = {
     "BacterialBlight": [
-        "Apply copper-based bactericide (e.g. Blitox 50 WP) - 3g/L water",
-        "Improve field drainage to reduce moisture buildup",
+        "Apply copper-based bactericide (e.g. Blitox 50 WP) — 3 g/L water",
+        "Improve field drainage to reduce moisture build-up",
         "Remove and destroy severely infected cane stalks",
     ],
     "Healthy": [
@@ -92,17 +106,17 @@ PESTICIDE_ADVISORY = {
     ],
     "RedRot": [
         "Apply Mancozeb or Carbendazim fungicide as soil drench",
-        "Avoid waterlogging - install proper drainage channels",
+        "Avoid waterlogging — install proper drainage channels",
         "Treat seed cane with Bavistin before planting",
     ],
     "Rust": [
         "Apply Propiconazole or Mancozeb fungicide spray",
-        "Monitor fields regularly during high humidity periods",
+        "Monitor fields regularly during high-humidity periods",
         "Reduce plant density to improve air circulation",
     ],
     "YellowLeaf": [
         "Apply balanced fertilizer focusing on Potassium and Micronutrients",
-        "Use foliar spray of 0.5% ZnSO4 + 0.5% MgSO4",
+        "Use foliar spray of 0.5 % ZnSO₄ + 0.5 % MgSO₄",
         "Monitor for whitefly and aphid vectors of YLD virus",
     ],
 }
@@ -110,15 +124,15 @@ PESTICIDE_ADVISORY = {
 MODELS = {}
 
 # ============================================================
-# DOWNLOAD ARTIFACTS  —  gdown 6.x compatible
+# DOWNLOAD ARTIFACTS — gdown 6.x compatible
 # ============================================================
 
 def ensure_artifacts_downloaded():
     if os.path.exists(CNN_WEIGHTS_PATH):
-        print("[INFO] artifacts/ already present, skipping download.")
+        print("[INFO] artifacts/ already present — skipping download.")
         return
 
-    print("[INFO] Downloading artifacts.zip from Google Drive...")
+    print("[INFO] Downloading artifacts.zip from Google Drive …")
 
     if os.path.exists(ARTIFACT_DIR):
         shutil.rmtree(ARTIFACT_DIR)
@@ -126,14 +140,13 @@ def ensure_artifacts_downloaded():
         os.remove(ARTIFACT_ZIP_PATH)
 
     import gdown
-    # gdown 6.x: no fuzzy argument — use url= directly
     url = f"https://drive.google.com/uc?id={ARTIFACTS_ZIP_FILE_ID}&export=download"
     gdown.download(url, ARTIFACT_ZIP_PATH, quiet=False)
 
     size = os.path.getsize(ARTIFACT_ZIP_PATH)
-    print(f"[INFO] Downloaded {size} bytes to {ARTIFACT_ZIP_PATH}")
+    print(f"[INFO] Downloaded {size} bytes → {ARTIFACT_ZIP_PATH}")
 
-    if size < 1000:
+    if size < 1_000:
         raise RuntimeError(
             "Download too small — Google Drive may have returned an HTML error page. "
             "Make sure the file is shared as 'Anyone with the link can view'."
@@ -152,6 +165,7 @@ def check_file_exists(path, name):
     if not os.path.exists(path):
         raise FileNotFoundError(f"{name} not found at: {path}")
 
+
 def normalize_prob_dict(prob_dict):
     keys = list(prob_dict.keys())
     vals = np.array(list(prob_dict.values()), dtype=np.float32)
@@ -159,8 +173,10 @@ def normalize_prob_dict(prob_dict):
     vals /= vals.sum()
     return {k: float(v) for k, v in zip(keys, vals)}
 
+
 def to_canonical_name(name):
     return CLASS_NAME_MAP.get(str(name).strip(), str(name).strip())
+
 
 def apply_temperature_scaling(raw_probs, T):
     logits  = np.log(raw_probs + 1e-9)
@@ -169,18 +185,27 @@ def apply_temperature_scaling(raw_probs, T):
     exp_s   = np.exp(shifted)
     return exp_s / exp_s.sum()
 
+
 def safe_label_transform(encoder, value, field_name):
     value = str(value).strip()
     if value not in encoder.classes_:
-        raise ValueError(f"Unknown {field_name}: '{value}'. Allowed: {list(encoder.classes_)}")
+        raise ValueError(
+            f"Unknown {field_name}: '{value}'. Allowed: {list(encoder.classes_)}"
+        )
     return int(encoder.transform([value])[0])
 
+
 def to_python(obj):
-    if isinstance(obj, dict):   return {str(k): to_python(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)): return [to_python(x) for x in obj]
-    if isinstance(obj, np.integer):  return int(obj)
-    if isinstance(obj, np.floating): return float(obj)
-    if isinstance(obj, np.ndarray):  return obj.tolist()
+    if isinstance(obj, dict):
+        return {str(k): to_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_python(x) for x in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
     return obj
 
 # ============================================================
@@ -190,7 +215,7 @@ def to_python(obj):
 def build_cnn_model(num_classes):
     base = tf.keras.applications.EfficientNetB0(
         include_top=False, weights="imagenet",
-        input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)
+        input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3),
     )
     base.trainable = False
 
@@ -198,45 +223,94 @@ def build_cnn_model(num_classes):
     x = tf.keras.applications.efficientnet.preprocess_input(inputs)
     x = base(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    attn = tf.keras.layers.Dense(1280 // 4, activation="relu",     name="attn_squeeze")(x)
-    attn = tf.keras.layers.Dense(1280,       activation="sigmoid",  name="attn_excite")(attn)
+    attn = tf.keras.layers.Dense(1280 // 4, activation="relu",    name="attn_squeeze")(x)
+    attn = tf.keras.layers.Dense(1280,       activation="sigmoid", name="attn_excite")(attn)
     x    = tf.keras.layers.Multiply(name="attn_weighted")([x, attn])
     x    = tf.keras.layers.Dropout(0.35)(x)
     out  = tf.keras.layers.Dense(num_classes, activation="softmax", name="classifier")(x)
     return tf.keras.Model(inputs, out, name="EfficientNet_AttentionHead")
 
 # ============================================================
+# TF-INFERENCE THREAD — single dedicated thread for ALL TF calls
+# ============================================================
+# TensorFlow on CPU can deadlock when called from arbitrary
+# background threads (especially behind gunicorn).  We funnel
+# every TF call through ONE long-lived worker thread.
+
+_tf_queue = queue.Queue()
+
+
+def _tf_worker():
+    """Runs forever. Pulls (func, args, result_event, result_holder) off the queue."""
+    while True:
+        func, args, result_holder, done_event = _tf_queue.get()
+        try:
+            result_holder["value"] = func(*args)
+        except Exception as exc:
+            result_holder["error"] = exc
+        finally:
+            done_event.set()
+
+
+def run_on_tf_thread(func, *args, timeout=300):
+    """Call *func* on the dedicated TF thread and block until done."""
+    holder = {}
+    event  = threading.Event()
+    _tf_queue.put((func, args, holder, event))
+    if not event.wait(timeout=timeout):
+        raise TimeoutError(f"TF inference did not complete within {timeout}s")
+    if "error" in holder:
+        raise holder["error"]
+    return holder["value"]
+
+
+# Start the dedicated TF thread once at import time
+_tf_thread = threading.Thread(target=_tf_worker, daemon=True)
+_tf_thread.start()
+
+# ============================================================
 # LOAD ALL MODELS
 # ============================================================
 
 def load_all_models():
-    print("[STARTUP] Loading all models...")
+    print("[STARTUP] Loading all models …")
     ensure_artifacts_downloaded()
 
     for name, path in {
-        "CNN weights":        CNN_WEIGHTS_PATH,
-        "Class names":        CLASS_NAMES_PATH,
-        "Env disease model":  ENV_DISEASE_MODEL_PATH,
-        "Env encoder":        ENV_DISEASE_ENCODER_PATH,
-        "Rec model":          REC_MODEL_PATH,
-        "Fert encoder":       FERT_ENCODER_PATH,
-        "Soil encoder":       SOIL_ENCODER_PATH,
-        "Crop encoder":       CROP_ENCODER_PATH,
-        "Numeric scaler":     NUMERIC_SCALER_PATH,
+        "CNN weights":       CNN_WEIGHTS_PATH,
+        "Class names":       CLASS_NAMES_PATH,
+        "Env disease model": ENV_DISEASE_MODEL_PATH,
+        "Env encoder":       ENV_DISEASE_ENCODER_PATH,
+        "Rec model":         REC_MODEL_PATH,
+        "Fert encoder":      FERT_ENCODER_PATH,
+        "Soil encoder":      SOIL_ENCODER_PATH,
+        "Crop encoder":      CROP_ENCODER_PATH,
+        "Numeric scaler":    NUMERIC_SCALER_PATH,
     }.items():
         check_file_exists(path, name)
 
+    # --- class names ---
     with open(CLASS_NAMES_PATH) as f:
         MODELS["class_names"] = json.load(f)
 
-    MODELS["cnn"] = build_cnn_model(len(MODELS["class_names"]))
-    MODELS["cnn"].load_weights(CNN_WEIGHTS_PATH)
+    # --- build & load CNN (on the TF thread) ---
+    def _build_and_load():
+        model = build_cnn_model(len(MODELS["class_names"]))
+        model.load_weights(CNN_WEIGHTS_PATH)
+        # Warm-up: one dummy forward pass so the graph is fully built
+        dummy = tf.zeros([1, IMG_SIZE[0], IMG_SIZE[1], 3], dtype=tf.float32)
+        _ = model(dummy, training=False)
+        return model
 
+    MODELS["cnn"] = run_on_tf_thread(_build_and_load, timeout=600)
+
+    # --- temperature ---
     MODELS["temperature"] = 1.0
     if os.path.exists(TEMP_SCALE_PATH):
         with open(TEMP_SCALE_PATH) as f:
             MODELS["temperature"] = json.load(f).get("temperature", 1.0)
 
+    # --- sklearn / xgb models ---
     MODELS["env_model"]    = joblib.load(ENV_DISEASE_MODEL_PATH)
     MODELS["env_encoder"]  = joblib.load(ENV_DISEASE_ENCODER_PATH)
     MODELS["rec_model"]    = joblib.load(REC_MODEL_PATH)
@@ -245,27 +319,27 @@ def load_all_models():
     MODELS["crop_encoder"] = joblib.load(CROP_ENCODER_PATH)
     MODELS["scaler"]       = joblib.load(NUMERIC_SCALER_PATH)
 
-    print(f"[STARTUP] Temperature T={MODELS['temperature']:.4f}")
+    print(f"[STARTUP] Temperature T = {MODELS['temperature']:.4f}")
     print("[STARTUP] All models loaded successfully.")
 
-    # Warm up: run one dummy inference in the main thread so TF builds its graph here.
-    # This prevents deadlocks when background threads later call the model.
-    print("[STARTUP] Warming up CNN model...")
-    dummy = tf.zeros([1, IMG_SIZE[0], IMG_SIZE[1], 3], dtype=tf.float32)
-    _ = MODELS["cnn"](dummy, training=False)
-    print("[STARTUP] Warmup complete.")
+# ============================================================
+# INFERENCE FUNCTIONS
+# ============================================================
 
-# ============================================================
-# INFERENCE
-# ============================================================
+def _tf_predict_image(image_path):
+    """Must run on the TF thread."""
+    img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+    arr = tf.keras.utils.img_to_array(img)
+    arr = tf.keras.applications.efficientnet.preprocess_input(
+        np.expand_dims(arr, 0)
+    )
+    tensor = tf.constant(arr, dtype=tf.float32)
+    raw    = MODELS["cnn"](tensor, training=False).numpy()[0]
+    return raw
+
 
 def predict_image_disease_probs(image_path):
-    img   = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
-    arr   = tf.keras.utils.img_to_array(img)
-    arr   = tf.keras.applications.efficientnet.preprocess_input(np.expand_dims(arr, 0))
-    arr   = tf.constant(arr, dtype=tf.float32)
-    # Direct model call is thread-safe; model.predict() deadlocks in background threads
-    raw   = MODELS["cnn"](arr, training=False).numpy()[0]
+    raw   = run_on_tf_thread(_tf_predict_image, image_path, timeout=120)
     cal   = apply_temperature_scaling(raw, MODELS["temperature"])
     raw_p = {cls: float(p) for cls, p in zip(MODELS["class_names"], cal)}
     canon = {d: 0.0 for d in CANONICAL_DISEASE_CLASSES}
@@ -275,29 +349,39 @@ def predict_image_disease_probs(image_path):
             canon[c] += p
     return normalize_prob_dict(canon)
 
+
 def preprocess_env_input(env_input):
     df = pd.DataFrame([env_input]).copy()
     for col in NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="raise")
-    df[NUMERIC_COLS]     = MODELS["scaler"].transform(df[NUMERIC_COLS])
-    df["Soil Type Enc"]  = safe_label_transform(MODELS["soil_encoder"], df.loc[0, "Soil Type"], "Soil Type")
-    df["Crop Type Enc"]  = safe_label_transform(MODELS["crop_encoder"], df.loc[0, "Crop Type"], "Crop Type")
+    df[NUMERIC_COLS]    = MODELS["scaler"].transform(df[NUMERIC_COLS])
+    df["Soil Type Enc"] = safe_label_transform(
+        MODELS["soil_encoder"], df.loc[0, "Soil Type"], "Soil Type"
+    )
+    df["Crop Type Enc"] = safe_label_transform(
+        MODELS["crop_encoder"], df.loc[0, "Crop Type"], "Crop Type"
+    )
     return df
 
+
 def predict_env_disease_probs(env_df):
-    probs  = MODELS["env_model"].predict_proba(env_df[ENV_FEATURE_COLS])[0]
-    names  = MODELS["env_encoder"].inverse_transform(np.arange(len(probs)))
-    out    = {to_canonical_name(c): float(p) for c, p in zip(names, probs)}
-    full   = {d: out.get(d, 0.0) for d in CANONICAL_DISEASE_CLASSES}
+    probs = MODELS["env_model"].predict_proba(env_df[ENV_FEATURE_COLS])[0]
+    names = MODELS["env_encoder"].inverse_transform(np.arange(len(probs)))
+    out   = {to_canonical_name(c): float(p) for c, p in zip(names, probs)}
+    full  = {d: out.get(d, 0.0) for d in CANONICAL_DISEASE_CLASSES}
     return normalize_prob_dict(full)
+
 
 def fuse_disease_probabilities(image_probs, env_probs):
     ci    = max(image_probs.values())
     ce    = max(env_probs.values())
     alpha = ci / (ci + ce + 1e-8)
-    fused = {d: alpha * image_probs.get(d, 0.0) + (1 - alpha) * env_probs.get(d, 0.0)
-             for d in CANONICAL_DISEASE_CLASSES}
+    fused = {
+        d: alpha * image_probs.get(d, 0.0) + (1 - alpha) * env_probs.get(d, 0.0)
+        for d in CANONICAL_DISEASE_CLASSES
+    }
     return normalize_prob_dict(fused), float(alpha)
+
 
 def predict_final_recommendations(env_df, fused_disease_probs):
     scores = np.zeros(len(MODELS["fert_encoder"].classes_), dtype=np.float32)
@@ -306,45 +390,75 @@ def predict_final_recommendations(env_df, fused_disease_probs):
         for d in CANONICAL_DISEASE_CLASSES:
             tmp[f"dprob_{d}"] = 0.0
         tmp[f"dprob_{disease}"] = 1.0
-        scores += float(prob) * MODELS["rec_model"].predict_proba(tmp[REC_FEATURE_COLS])[0]
+        scores += float(prob) * MODELS["rec_model"].predict_proba(
+            tmp[REC_FEATURE_COLS]
+        )[0]
     scores /= scores.sum()
     names = MODELS["fert_encoder"].inverse_transform(np.arange(len(scores)))
-    return dict(sorted({str(k): float(v) for k, v in zip(names, scores)}.items(),
-                       key=lambda x: x[1], reverse=True))
+    return dict(
+        sorted(
+            {str(k): float(v) for k, v in zip(names, scores)}.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+    )
+
+
+def _tf_gradcam(image_path):
+    """Must run on the TF thread."""
+    cnn     = MODELS["cnn"]
+    img     = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+    img_arr = tf.keras.utils.img_to_array(img)
+    proc    = tf.keras.applications.efficientnet.preprocess_input(
+        np.expand_dims(img_arr.copy(), 0).astype(np.float32)
+    )
+    tensor = tf.convert_to_tensor(proc, dtype=tf.float32)
+
+    base_model = next(
+        (l for l in cnn.layers
+         if isinstance(l, tf.keras.Model) and "efficientnet" in l.name.lower()),
+        None,
+    )
+    if base_model is None:
+        return None
+
+    grad_model = tf.keras.Model(
+        inputs=cnn.inputs,
+        outputs=[base_model.get_layer("top_conv").output, cnn.output],
+    )
+    with tf.GradientTape() as tape:
+        conv_out, preds = grad_model(tensor, training=False)
+        class_ch = preds[:, tf.argmax(preds[0])]
+    grads   = tape.gradient(class_ch, conv_out)
+    pooled  = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
+    heatmap = np.maximum(heatmap, 0)
+    heatmap /= heatmap.max() + 1e-8
+    heatmap_r = np.array(
+        tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)
+    ).squeeze()
+    return img_arr, heatmap_r
+
 
 def generate_gradcam_base64(image_path):
     try:
-        cnn     = MODELS["cnn"]
-        img     = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
-        img_arr = tf.keras.utils.img_to_array(img)
-        proc    = tf.keras.applications.efficientnet.preprocess_input(
-                      np.expand_dims(img_arr.copy(), 0).astype(np.float32))
-        tensor  = tf.convert_to_tensor(proc, dtype=tf.float32)
-
-        base_model = next((l for l in cnn.layers
-                           if isinstance(l, tf.keras.Model) and "efficientnet" in l.name.lower()), None)
-        if base_model is None:
+        result = run_on_tf_thread(_tf_gradcam, image_path, timeout=120)
+        if result is None:
             return None
+        img_arr, heatmap_r = result
 
-        grad_model = tf.keras.Model(
-            inputs=cnn.inputs,
-            outputs=[base_model.get_layer("top_conv").output, cnn.output]
-        )
-        with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(tensor, training=False)
-            class_ch = preds[:, tf.argmax(preds[0])]
-        grads   = tape.gradient(class_ch, conv_out)
-        pooled  = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
-        heatmap = np.maximum(heatmap, 0)
-        heatmap /= (heatmap.max() + 1e-8)
-        heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
         cmap    = cm_module.get_cmap("jet")
-        overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * cmap(heatmap_r)[:, :, :3], 0, 1)
+        overlay = np.clip(
+            0.5 * (img_arr / 255.0) + 0.5 * cmap(heatmap_r)[:, :, :3], 0, 1
+        )
 
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(img_arr.astype(np.uint8)); axes[0].set_title("Input Leaf"); axes[0].axis("off")
-        axes[1].imshow(overlay);                  axes[1].set_title("Grad-CAM");   axes[1].axis("off")
+        axes[0].imshow(img_arr.astype(np.uint8))
+        axes[0].set_title("Input Leaf")
+        axes[0].axis("off")
+        axes[1].imshow(overlay)
+        axes[1].set_title("Grad-CAM")
+        axes[1].axis("off")
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
@@ -362,7 +476,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# HTML
+# HTML  (identical UI — no changes)
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -386,7 +500,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .field-label{display:block;font-size:.8rem;font-weight:500;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px;}
   input[type=number],select{width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:.95rem;background:#fafafa;transition:border-color .2s;}
   input[type=number]:focus,select:focus{outline:none;border-color:var(--green-lt);}
-  /* FILE UPLOAD */
   #file-input{width:1px;height:1px;opacity:0;position:absolute;}
   .upload-label{display:block;border:2px dashed var(--green-lt);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:background .2s;background:#f7fdf9;user-select:none;}
   .upload-label:hover{background:#edf7f0;}
@@ -394,16 +507,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .upload-label p{color:var(--muted);font-size:.9rem;}
   #file-status{margin-top:8px;font-size:.85rem;font-weight:500;color:var(--green);display:none;text-align:center;}
   #preview-img{max-width:100%;border-radius:10px;margin-top:14px;display:none;box-shadow:0 2px 8px rgba(0,0,0,.12);}
-  /* BUTTON */
   .btn{width:100%;padding:14px;background:var(--green);color:#fff;border:none;border-radius:12px;font-family:'DM Sans',sans-serif;font-size:1rem;font-weight:500;cursor:pointer;transition:background .2s;margin-top:4px;}
   .btn:hover{background:#245a40;}
   .btn:disabled{background:#aaa;cursor:not-allowed;}
-  /* SPINNER */
   .spinner{display:none;width:36px;height:36px;border:4px solid #e0e0e0;border-top-color:var(--green);border-radius:50%;animation:spin .8s linear infinite;margin:20px auto;}
   @keyframes spin{to{transform:rotate(360deg);}}
   .status-msg{text-align:center;color:var(--muted);font-size:.9rem;display:none;padding:8px;}
   .error-msg{background:#ffeef0;border-left:3px solid var(--rust);border-radius:8px;padding:12px 16px;color:#8b0000;font-size:.9rem;display:none;white-space:pre-wrap;margin-top:12px;}
-  /* RESULTS */
   #result-section{display:none;}
   .disease-badge{display:inline-block;padding:6px 18px;border-radius:99px;font-weight:500;background:var(--green);color:#fff;margin-bottom:12px;}
   .bar-wrap{margin:8px 0 18px;}
@@ -508,7 +618,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   var selectedFile = null;
   var pollTimer    = null;
 
-  // ---- file input ----
   var fileInput = document.getElementById('file-input');
   fileInput.addEventListener('change', function(){
     if (!this.files || !this.files.length) return;
@@ -648,38 +757,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </html>"""
 
 # ============================================================
-# JOB QUEUE  —  async so Render 30s proxy never triggers
+# JOB QUEUE — async so Render 30-s proxy never triggers
 # ============================================================
 _jobs      = {}
 _jobs_lock = threading.Lock()
-JOB_TIMEOUT_SECONDS = 180  # mark job failed if it takes longer than this
+JOB_TIMEOUT_SECONDS = 300  # generous for free-tier CPU
 
-def _watchdog(job_id, timeout):
-    """Background timer — marks job as error if it never completes."""
-    import time
-    time.sleep(timeout)
-    with _jobs_lock:
-        if _jobs.get(job_id, {}).get("status") == "pending":
-            _jobs[job_id] = {
-                "status": "error",
-                "error": f"Analysis timed out after {timeout}s. "
-                         "The server CPU may be overloaded. Please try again."
-            }
 
 def _run_job(job_id, image_bytes, image_suffix, env_input):
     tmp_path = None
     try:
+        t0 = time.time()
+        print(f"[JOB {job_id[:8]}] Starting analysis …")
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=image_suffix) as tmp:
             tmp.write(image_bytes)
             tmp_path = tmp.name
 
-        img_probs    = predict_image_disease_probs(tmp_path)
+        print(f"[JOB {job_id[:8]}] Running CNN prediction …")
+        img_probs = predict_image_disease_probs(tmp_path)
+        print(f"[JOB {job_id[:8]}] CNN done in {time.time()-t0:.1f}s")
+
         env_df       = preprocess_env_input(env_input)
         env_probs    = predict_env_disease_probs(env_df)
         fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
         fert_probs   = predict_final_recommendations(env_df, fused)
         predicted    = max(fused, key=fused.get)
-        gradcam      = generate_gradcam_base64(tmp_path)
+
+        print(f"[JOB {job_id[:8]}] Generating Grad-CAM …")
+        gradcam = generate_gradcam_base64(tmp_path)
+
+        elapsed = time.time() - t0
+        print(f"[JOB {job_id[:8]}] Complete in {elapsed:.1f}s — disease={predicted}")
 
         result = {
             "predicted_disease":          str(predicted),
@@ -694,31 +803,39 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
             "gradcam_base64":             gradcam,
         }
         with _jobs_lock:
-            # Only write result if watchdog hasn't already timed it out
-            if _jobs.get(job_id, {}).get("status") == "pending":
-                _jobs[job_id] = {"status": "done", "result": to_python(result)}
+            _jobs[job_id] = {"status": "done", "result": to_python(result)}
 
     except Exception as e:
+        print(f"[JOB {job_id[:8]}] FAILED: {e}")
         with _jobs_lock:
-            if _jobs.get(job_id, {}).get("status") == "pending":
-                _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
+            _jobs[job_id] = {
+                "status":    "error",
+                "error":     str(e),
+                "traceback": _tb.format_exc(),
+            }
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
+
 # ============================================================
-# STARTUP  —  blocking load before gunicorn forks workers
+# MODEL LOADING  — in a background thread so the port opens fast
 # ============================================================
 MODELS_READY = False
 MODELS_ERROR = None
 
-try:
-    load_all_models()
-    MODELS_READY = True
-    print("[STARTUP] Models ready — app fully operational.")
-except Exception as _e:
-    MODELS_ERROR = _tb.format_exc()
-    print("[STARTUP ERROR]", _e)
+def _background_load():
+    global MODELS_READY, MODELS_ERROR
+    try:
+        load_all_models()
+        MODELS_READY = True
+        print("[STARTUP] ✅  Models ready — app fully operational.")
+    except Exception as _e:
+        MODELS_ERROR = _tb.format_exc()
+        print("[STARTUP ERROR]", _e)
+
+_loader_thread = threading.Thread(target=_background_load, daemon=True)
+_loader_thread.start()
 
 # ============================================================
 # ROUTES
@@ -726,7 +843,7 @@ except Exception as _e:
 
 LOADING_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="8">
-<title>SugarCane AI - Starting up</title>
+<title>SugarCane AI — Starting up</title>
 <style>
   body{font-family:sans-serif;background:#fefae0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
   .box{text-align:center;background:#fff;padding:40px 60px;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,.1);}
@@ -736,8 +853,8 @@ LOADING_PAGE = """<!DOCTYPE html>
 </style></head>
 <body><div class="box">
   <div class="sp"></div>
-  <h2>SugarCane AI is starting up...</h2>
-  <p>Downloading AI models. Takes <strong>1-3 minutes</strong> on first launch.</p>
+  <h2>SugarCane AI is starting up …</h2>
+  <p>Downloading AI models. Takes <strong>1–3 minutes</strong> on first launch.</p>
   <p style="margin-top:12px;font-size:.85rem;color:#aaa">Page refreshes every 8 seconds.</p>
 </div></body></html>"""
 
@@ -753,8 +870,10 @@ def index():
 
 @app.route("/health")
 def health():
-    if MODELS_READY:  return "OK", 200
-    if MODELS_ERROR:  return "ERROR: " + MODELS_ERROR, 500
+    if MODELS_READY:
+        return "OK", 200
+    if MODELS_ERROR:
+        return "ERROR: " + MODELS_ERROR, 500
     return "Loading...", 200
 
 
@@ -789,8 +908,7 @@ def submit():
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending"}
 
-    threading.Thread(target=_run_job,   args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
-    threading.Thread(target=_watchdog,  args=(job_id, JOB_TIMEOUT_SECONDS),                  daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
 
     return jsonify({"job_id": job_id})
 
@@ -801,10 +919,23 @@ def result(job_id):
         job = _jobs.get(job_id)
     if job is None:
         return jsonify({"status": "error", "error": "Unknown job ID"}), 404
+
+    # Check if job has been pending too long
+    if job.get("status") == "pending":
+        created = job.get("created", time.time())
+        if time.time() - created > JOB_TIMEOUT_SECONDS:
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "status": "error",
+                    "error": f"Analysis timed out after {JOB_TIMEOUT_SECONDS}s. "
+                             "The server CPU may be overloaded. Please try again.",
+                }
+            return jsonify(_jobs[job_id])
+
     return jsonify(job)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("[INFO] Starting on http://0.0.0.0:" + str(port))
+    print(f"[INFO] Starting Flask dev server on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
