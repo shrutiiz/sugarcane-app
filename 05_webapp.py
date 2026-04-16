@@ -1,14 +1,9 @@
 """
-CODE 05 - Web Application (Flask - Permanent Deployment on Render)
-Fixes applied:
-  - gdown 6.x compatible download
-  - Async job queue so Render 30-s proxy timeout never triggers
-  - TensorFlow thread-safety: all TF inference on a dedicated single thread
-  - Eager-mode warmup before gunicorn forks
-  - Proper port binding so Render detects the service quickly
+CODE 05 - Web Application (Flask - Render Deployment)
 """
 
 import os
+import sys
 import json
 import base64
 import tempfile
@@ -24,14 +19,12 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# ── Force TF to CPU and suppress noisy logs BEFORE import ──────────
+# ── Force CPU-only and suppress logs BEFORE importing TF ──
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import tensorflow as tf
-
-# Force eager mode (no graph compilation surprises)
 tf.config.run_functions_eagerly(True)
 
 import matplotlib
@@ -41,6 +34,9 @@ import matplotlib.cm as cm_module
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# Force unbuffered output so Render logs show immediately
+print = lambda *a, **k: (sys.stdout.write(" ".join(map(str, a)) + k.get("end", "\n")), sys.stdout.flush())  # ← FIX
 
 # ============================================================
 # CONFIG
@@ -116,7 +112,7 @@ PESTICIDE_ADVISORY = {
     ],
     "YellowLeaf": [
         "Apply balanced fertilizer focusing on Potassium and Micronutrients",
-        "Use foliar spray of 0.5 % ZnSO₄ + 0.5 % MgSO₄",
+        "Use foliar spray of 0.5% ZnSO4 + 0.5% MgSO4",
         "Monitor for whitefly and aphid vectors of YLD virus",
     ],
 }
@@ -124,7 +120,7 @@ PESTICIDE_ADVISORY = {
 MODELS = {}
 
 # ============================================================
-# DOWNLOAD ARTIFACTS — gdown 6.x compatible
+# DOWNLOAD ARTIFACTS
 # ============================================================
 
 def ensure_artifacts_downloaded():
@@ -148,8 +144,7 @@ def ensure_artifacts_downloaded():
 
     if size < 1_000:
         raise RuntimeError(
-            "Download too small — Google Drive may have returned an HTML error page. "
-            "Make sure the file is shared as 'Anyone with the link can view'."
+            "Download too small — Google Drive may have returned an HTML error page."
         )
 
     with zipfile.ZipFile(ARTIFACT_ZIP_PATH, "r") as zf:
@@ -165,7 +160,6 @@ def check_file_exists(path, name):
     if not os.path.exists(path):
         raise FileNotFoundError(f"{name} not found at: {path}")
 
-
 def normalize_prob_dict(prob_dict):
     keys = list(prob_dict.keys())
     vals = np.array(list(prob_dict.values()), dtype=np.float32)
@@ -173,10 +167,8 @@ def normalize_prob_dict(prob_dict):
     vals /= vals.sum()
     return {k: float(v) for k, v in zip(keys, vals)}
 
-
 def to_canonical_name(name):
     return CLASS_NAME_MAP.get(str(name).strip(), str(name).strip())
-
 
 def apply_temperature_scaling(raw_probs, T):
     logits  = np.log(raw_probs + 1e-9)
@@ -185,15 +177,11 @@ def apply_temperature_scaling(raw_probs, T):
     exp_s   = np.exp(shifted)
     return exp_s / exp_s.sum()
 
-
 def safe_label_transform(encoder, value, field_name):
     value = str(value).strip()
     if value not in encoder.classes_:
-        raise ValueError(
-            f"Unknown {field_name}: '{value}'. Allowed: {list(encoder.classes_)}"
-        )
+        raise ValueError(f"Unknown {field_name}: '{value}'. Allowed: {list(encoder.classes_)}")
     return int(encoder.transform([value])[0])
-
 
 def to_python(obj):
     if isinstance(obj, dict):
@@ -213,11 +201,13 @@ def to_python(obj):
 # ============================================================
 
 def build_cnn_model(num_classes):
+    print("[MODEL] Building EfficientNet model …")
     base = tf.keras.applications.EfficientNetB0(
         include_top=False, weights="imagenet",
         input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3),
     )
     base.trainable = False
+    print("[MODEL] EfficientNet base loaded.")
 
     inputs = tf.keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
     x = tf.keras.applications.efficientnet.preprocess_input(inputs)
@@ -228,48 +218,12 @@ def build_cnn_model(num_classes):
     x    = tf.keras.layers.Multiply(name="attn_weighted")([x, attn])
     x    = tf.keras.layers.Dropout(0.35)(x)
     out  = tf.keras.layers.Dense(num_classes, activation="softmax", name="classifier")(x)
-    return tf.keras.Model(inputs, out, name="EfficientNet_AttentionHead")
+    model = tf.keras.Model(inputs, out, name="EfficientNet_AttentionHead")
+    print("[MODEL] Full model built successfully.")
+    return model
 
 # ============================================================
-# TF-INFERENCE THREAD — single dedicated thread for ALL TF calls
-# ============================================================
-# TensorFlow on CPU can deadlock when called from arbitrary
-# background threads (especially behind gunicorn).  We funnel
-# every TF call through ONE long-lived worker thread.
-
-_tf_queue = queue.Queue()
-
-
-def _tf_worker():
-    """Runs forever. Pulls (func, args, result_event, result_holder) off the queue."""
-    while True:
-        func, args, result_holder, done_event = _tf_queue.get()
-        try:
-            result_holder["value"] = func(*args)
-        except Exception as exc:
-            result_holder["error"] = exc
-        finally:
-            done_event.set()
-
-
-def run_on_tf_thread(func, *args, timeout=300):
-    """Call *func* on the dedicated TF thread and block until done."""
-    holder = {}
-    event  = threading.Event()
-    _tf_queue.put((func, args, holder, event))
-    if not event.wait(timeout=timeout):
-        raise TimeoutError(f"TF inference did not complete within {timeout}s")
-    if "error" in holder:
-        raise holder["error"]
-    return holder["value"]
-
-
-# Start the dedicated TF thread once at import time
-_tf_thread = threading.Thread(target=_tf_worker, daemon=True)
-_tf_thread.start()
-
-# ============================================================
-# LOAD ALL MODELS
+# LOAD ALL MODELS — runs directly on calling thread (NO tf-thread indirection)
 # ============================================================
 
 def load_all_models():
@@ -288,29 +242,29 @@ def load_all_models():
         "Numeric scaler":    NUMERIC_SCALER_PATH,
     }.items():
         check_file_exists(path, name)
+    print("[STARTUP] All artifact files verified.")
 
-    # --- class names ---
     with open(CLASS_NAMES_PATH) as f:
         MODELS["class_names"] = json.load(f)
+    print(f"[STARTUP] Class names: {MODELS['class_names']}")
 
-    # --- build & load CNN (on the TF thread) ---
-    def _build_and_load():
-        model = build_cnn_model(len(MODELS["class_names"]))
-        model.load_weights(CNN_WEIGHTS_PATH)
-        # Warm-up: one dummy forward pass so the graph is fully built
-        dummy = tf.zeros([1, IMG_SIZE[0], IMG_SIZE[1], 3], dtype=tf.float32)
-        _ = model(dummy, training=False)
-        return model
+    # ← FIX: Build and load CNN directly — no thread indirection
+    MODELS["cnn"] = build_cnn_model(len(MODELS["class_names"]))
+    print("[STARTUP] Loading CNN weights …")
+    MODELS["cnn"].load_weights(CNN_WEIGHTS_PATH)
+    print("[STARTUP] CNN weights loaded.")
 
-    MODELS["cnn"] = run_on_tf_thread(_build_and_load, timeout=600)
+    # Warm up
+    print("[STARTUP] Warming up CNN …")
+    dummy = np.zeros((1, IMG_SIZE[0], IMG_SIZE[1], 3), dtype=np.float32)
+    _ = MODELS["cnn"](dummy, training=False)
+    print("[STARTUP] CNN warmup done.")
 
-    # --- temperature ---
     MODELS["temperature"] = 1.0
     if os.path.exists(TEMP_SCALE_PATH):
         with open(TEMP_SCALE_PATH) as f:
             MODELS["temperature"] = json.load(f).get("temperature", 1.0)
 
-    # --- sklearn / xgb models ---
     MODELS["env_model"]    = joblib.load(ENV_DISEASE_MODEL_PATH)
     MODELS["env_encoder"]  = joblib.load(ENV_DISEASE_ENCODER_PATH)
     MODELS["rec_model"]    = joblib.load(REC_MODEL_PATH)
@@ -320,23 +274,52 @@ def load_all_models():
     MODELS["scaler"]       = joblib.load(NUMERIC_SCALER_PATH)
 
     print(f"[STARTUP] Temperature T = {MODELS['temperature']:.4f}")
-    print("[STARTUP] All models loaded successfully.")
+    print("[STARTUP] All sklearn/xgb models loaded.")
+
+# ============================================================
+# SINGLE TF INFERENCE THREAD — for request-time inference only
+# ============================================================
+
+_tf_queue = queue.Queue()
+
+def _tf_worker():
+    """Long-lived thread: pulls (func, args, holder, event) and runs func."""
+    print("[TF-THREAD] Inference worker started.")
+    while True:
+        func, args, holder, event = _tf_queue.get()
+        try:
+            holder["value"] = func(*args)
+        except Exception as exc:
+            holder["error"] = exc
+        finally:
+            event.set()
+
+def run_on_tf_thread(func, *args, timeout=300):
+    holder = {}
+    event  = threading.Event()
+    _tf_queue.put((func, args, holder, event))
+    if not event.wait(timeout=timeout):
+        raise TimeoutError(f"TF inference did not complete within {timeout}s")
+    if "error" in holder:
+        raise holder["error"]
+    return holder["value"]
+
+# Start TF inference thread
+_tf_thread = threading.Thread(target=_tf_worker, daemon=True)
+_tf_thread.start()
 
 # ============================================================
 # INFERENCE FUNCTIONS
 # ============================================================
 
 def _tf_predict_image(image_path):
-    """Must run on the TF thread."""
+    """Runs on TF thread."""
     img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
     arr = tf.keras.utils.img_to_array(img)
-    arr = tf.keras.applications.efficientnet.preprocess_input(
-        np.expand_dims(arr, 0)
-    )
+    arr = tf.keras.applications.efficientnet.preprocess_input(np.expand_dims(arr, 0))
     tensor = tf.constant(arr, dtype=tf.float32)
-    raw    = MODELS["cnn"](tensor, training=False).numpy()[0]
+    raw = MODELS["cnn"](tensor, training=False).numpy()[0]
     return raw
-
 
 def predict_image_disease_probs(image_path):
     raw   = run_on_tf_thread(_tf_predict_image, image_path, timeout=120)
@@ -349,20 +332,14 @@ def predict_image_disease_probs(image_path):
             canon[c] += p
     return normalize_prob_dict(canon)
 
-
 def preprocess_env_input(env_input):
     df = pd.DataFrame([env_input]).copy()
     for col in NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="raise")
     df[NUMERIC_COLS]    = MODELS["scaler"].transform(df[NUMERIC_COLS])
-    df["Soil Type Enc"] = safe_label_transform(
-        MODELS["soil_encoder"], df.loc[0, "Soil Type"], "Soil Type"
-    )
-    df["Crop Type Enc"] = safe_label_transform(
-        MODELS["crop_encoder"], df.loc[0, "Crop Type"], "Crop Type"
-    )
+    df["Soil Type Enc"] = safe_label_transform(MODELS["soil_encoder"], df.loc[0, "Soil Type"], "Soil Type")
+    df["Crop Type Enc"] = safe_label_transform(MODELS["crop_encoder"], df.loc[0, "Crop Type"], "Crop Type")
     return df
-
 
 def predict_env_disease_probs(env_df):
     probs = MODELS["env_model"].predict_proba(env_df[ENV_FEATURE_COLS])[0]
@@ -370,7 +347,6 @@ def predict_env_disease_probs(env_df):
     out   = {to_canonical_name(c): float(p) for c, p in zip(names, probs)}
     full  = {d: out.get(d, 0.0) for d in CANONICAL_DISEASE_CLASSES}
     return normalize_prob_dict(full)
-
 
 def fuse_disease_probabilities(image_probs, env_probs):
     ci    = max(image_probs.values())
@@ -382,7 +358,6 @@ def fuse_disease_probabilities(image_probs, env_probs):
     }
     return normalize_prob_dict(fused), float(alpha)
 
-
 def predict_final_recommendations(env_df, fused_disease_probs):
     scores = np.zeros(len(MODELS["fert_encoder"].classes_), dtype=np.float32)
     for disease, prob in fused_disease_probs.items():
@@ -390,22 +365,16 @@ def predict_final_recommendations(env_df, fused_disease_probs):
         for d in CANONICAL_DISEASE_CLASSES:
             tmp[f"dprob_{d}"] = 0.0
         tmp[f"dprob_{disease}"] = 1.0
-        scores += float(prob) * MODELS["rec_model"].predict_proba(
-            tmp[REC_FEATURE_COLS]
-        )[0]
+        scores += float(prob) * MODELS["rec_model"].predict_proba(tmp[REC_FEATURE_COLS])[0]
     scores /= scores.sum()
     names = MODELS["fert_encoder"].inverse_transform(np.arange(len(scores)))
-    return dict(
-        sorted(
-            {str(k): float(v) for k, v in zip(names, scores)}.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-    )
-
+    return dict(sorted(
+        {str(k): float(v) for k, v in zip(names, scores)}.items(),
+        key=lambda x: x[1], reverse=True
+    ))
 
 def _tf_gradcam(image_path):
-    """Must run on the TF thread."""
+    """Runs on TF thread."""
     cnn     = MODELS["cnn"]
     img     = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
     img_arr = tf.keras.utils.img_to_array(img)
@@ -434,11 +403,8 @@ def _tf_gradcam(image_path):
     heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
     heatmap = np.maximum(heatmap, 0)
     heatmap /= heatmap.max() + 1e-8
-    heatmap_r = np.array(
-        tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)
-    ).squeeze()
+    heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
     return img_arr, heatmap_r
-
 
 def generate_gradcam_base64(image_path):
     try:
@@ -476,7 +442,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# HTML  (identical UI — no changes)
+# HTML
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -542,9 +508,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="subtitle">Multimodal Disease Detection &amp; Fertilizer / Pesticide Recommendation</div>
   </div>
 </header>
-
 <div class="main">
-
   <div class="card">
     <h2>&#128247; Leaf Image</h2>
     <input type="file" id="file-input" accept="image/jpeg,image/jpg,image/png,image/webp">
@@ -556,37 +520,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div id="file-status"></div>
     <img id="preview-img" alt="preview">
   </div>
-
   <div class="card">
     <h2>&#127777; Field &amp; Soil Data</h2>
     <div class="grid-3" style="margin-bottom:16px">
-      <div><span class="field-label">Temperature (C)</span><input type="number" id="temp"  value="28" min="0" max="50"></div>
-      <div><span class="field-label">Humidity (%)</span>   <input type="number" id="hum"   value="82" min="0" max="100"></div>
-      <div><span class="field-label">Moisture (%)</span>   <input type="number" id="moist" value="44" min="0" max="100"></div>
+      <div><span class="field-label">Temperature (C)</span><input type="number" id="temp" value="28" min="0" max="50"></div>
+      <div><span class="field-label">Humidity (%)</span><input type="number" id="hum" value="82" min="0" max="100"></div>
+      <div><span class="field-label">Moisture (%)</span><input type="number" id="moist" value="44" min="0" max="100"></div>
     </div>
     <div class="grid-3" style="margin-bottom:16px">
-      <div><span class="field-label">Nitrogen (kg/ha)</span>  <input type="number" id="n" value="70" min="0" max="200"></div>
-      <div><span class="field-label">Potassium (kg/ha)</span> <input type="number" id="k" value="45" min="0" max="200"></div>
+      <div><span class="field-label">Nitrogen (kg/ha)</span><input type="number" id="n" value="70" min="0" max="200"></div>
+      <div><span class="field-label">Potassium (kg/ha)</span><input type="number" id="k" value="45" min="0" max="200"></div>
       <div><span class="field-label">Phosphorous (kg/ha)</span><input type="number" id="p" value="38" min="0" max="200"></div>
     </div>
     <div class="grid-2">
-      <div>
-        <span class="field-label">Soil Type</span>
-        <select id="soil"><option>Loamy</option><option>Clayey</option><option>Sandy</option><option>Red</option><option>Black</option></select>
-      </div>
-      <div>
-        <span class="field-label">Crop Type</span>
-        <select id="crop"><option>Sugarcane</option><option>Maize</option><option>Wheat</option><option>Rice</option><option>Cotton</option></select>
-      </div>
+      <div><span class="field-label">Soil Type</span><select id="soil"><option>Loamy</option><option>Clayey</option><option>Sandy</option><option>Red</option><option>Black</option></select></div>
+      <div><span class="field-label">Crop Type</span><select id="crop"><option>Sugarcane</option><option>Maize</option><option>Wheat</option><option>Rice</option><option>Cotton</option></select></div>
     </div>
   </div>
-
   <button class="btn" id="btn" onclick="runPrediction()">&#128269; Analyze &amp; Recommend</button>
-
   <div class="spinner" id="spinner"></div>
   <div class="status-msg" id="status"></div>
-  <div class="error-msg"  id="errmsg"></div>
-
+  <div class="error-msg" id="errmsg"></div>
   <div id="result-section">
     <div class="card">
       <h2>&#129440; Disease Prediction</h2>
@@ -612,143 +566,72 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
-
 <script>
 (function(){
-  var selectedFile = null;
-  var pollTimer    = null;
-
-  var fileInput = document.getElementById('file-input');
-  fileInput.addEventListener('change', function(){
-    if (!this.files || !this.files.length) return;
-    selectedFile = this.files[0];
-    var st = document.getElementById('file-status');
-    st.textContent = 'Selected: ' + selectedFile.name;
-    st.style.display = 'block';
-    var rdr = new FileReader();
-    rdr.onload = function(e){
-      var img = document.getElementById('preview-img');
-      img.src = e.target.result;
-      img.style.display = 'block';
-    };
-    rdr.readAsDataURL(selectedFile);
+  var selectedFile=null,pollTimer=null;
+  document.getElementById('file-input').addEventListener('change',function(){
+    if(!this.files||!this.files.length)return;
+    selectedFile=this.files[0];
+    var st=document.getElementById('file-status');
+    st.textContent='Selected: '+selectedFile.name;st.style.display='block';
+    var r=new FileReader();
+    r.onload=function(e){var img=document.getElementById('preview-img');img.src=e.target.result;img.style.display='block';};
+    r.readAsDataURL(selectedFile);
   });
-
-  function setStatus(msg){
-    var el = document.getElementById('status');
-    el.textContent = msg;
-    el.style.display = msg ? 'block' : 'none';
-  }
-  function showError(msg){
-    var el = document.getElementById('errmsg');
-    el.textContent = '\u26A0 ' + msg;
-    el.style.display = 'block';
-    setStatus('');
-  }
-  function resetUI(){
-    document.getElementById('spinner').style.display = 'none';
-    var btn = document.getElementById('btn');
-    btn.disabled = false;
-    btn.textContent = '\uD83D\uDD0D Analyze & Recommend';
-    setStatus('');
-    if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
-  }
-
-  window.runPrediction = function(){
-    if (!selectedFile){
-      showError('Please select a leaf image first.');
-      return;
-    }
-    var btn = document.getElementById('btn');
-    btn.disabled = true;
-    btn.textContent = 'Submitting...';
-    document.getElementById('spinner').style.display = 'block';
-    document.getElementById('errmsg').style.display  = 'none';
-    document.getElementById('result-section').style.display = 'none';
+  function setStatus(m){var e=document.getElementById('status');e.textContent=m;e.style.display=m?'block':'none';}
+  function showError(m){var e=document.getElementById('errmsg');e.textContent='\u26A0 '+m;e.style.display='block';setStatus('');}
+  function resetUI(){document.getElementById('spinner').style.display='none';var b=document.getElementById('btn');b.disabled=false;b.textContent='\uD83D\uDD0D Analyze & Recommend';setStatus('');if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+  window.runPrediction=function(){
+    if(!selectedFile){showError('Please select a leaf image first.');return;}
+    var btn=document.getElementById('btn');btn.disabled=true;btn.textContent='Submitting...';
+    document.getElementById('spinner').style.display='block';
+    document.getElementById('errmsg').style.display='none';
+    document.getElementById('result-section').style.display='none';
     setStatus('Uploading image...');
-
-    var fd = new FormData();
-    fd.append('image',       selectedFile);
-    fd.append('Temparature', document.getElementById('temp').value);
-    fd.append('Humidity',    document.getElementById('hum').value);
-    fd.append('Moisture',    document.getElementById('moist').value);
-    fd.append('Nitrogen',    document.getElementById('n').value);
-    fd.append('Potassium',   document.getElementById('k').value);
-    fd.append('Phosphorous', document.getElementById('p').value);
-    fd.append('Soil Type',   document.getElementById('soil').value);
-    fd.append('Crop Type',   document.getElementById('crop').value);
-
-    fetch('/submit', {method:'POST', body:fd})
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        if (d.error){ showError(d.error); resetUI(); return; }
-        var jobId   = d.job_id;
-        var elapsed = 0;
-        btn.textContent = 'Analyzing...';
-        setStatus('AI is analyzing your image...');
-
-        pollTimer = setInterval(function(){
-          elapsed += 3;
-          setStatus('Analyzing... (' + elapsed + 's elapsed)');
-          fetch('/result/' + jobId)
-            .then(function(r){ return r.json(); })
-            .then(function(poll){
-              if (poll.status === 'done'){
-                clearInterval(pollTimer); pollTimer = null;
-                resetUI();
-                if (poll.error) showError(poll.error + (poll.traceback ? '\n\n' + poll.traceback : ''));
-                else            renderResults(poll.result);
-              } else if (poll.status === 'error'){
-                clearInterval(pollTimer); pollTimer = null;
-                resetUI();
-                showError(poll.error || 'Analysis failed.');
-              }
-            })
-            .catch(function(){});
-        }, 3000);
-      })
-      .catch(function(e){ showError('Network error: ' + e.message); resetUI(); });
+    var fd=new FormData();
+    fd.append('image',selectedFile);
+    fd.append('Temparature',document.getElementById('temp').value);
+    fd.append('Humidity',document.getElementById('hum').value);
+    fd.append('Moisture',document.getElementById('moist').value);
+    fd.append('Nitrogen',document.getElementById('n').value);
+    fd.append('Potassium',document.getElementById('k').value);
+    fd.append('Phosphorous',document.getElementById('p').value);
+    fd.append('Soil Type',document.getElementById('soil').value);
+    fd.append('Crop Type',document.getElementById('crop').value);
+    fetch('/submit',{method:'POST',body:fd})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){showError(d.error);resetUI();return;}
+      var jobId=d.job_id,elapsed=0;
+      btn.textContent='Analyzing...';setStatus('AI is analyzing your image...');
+      pollTimer=setInterval(function(){
+        elapsed+=3;setStatus('Analyzing... ('+elapsed+'s elapsed)');
+        fetch('/result/'+jobId).then(function(r){return r.json();}).then(function(p){
+          if(p.status==='done'){clearInterval(pollTimer);pollTimer=null;resetUI();if(p.error)showError(p.error);else renderResults(p.result);}
+          else if(p.status==='error'){clearInterval(pollTimer);pollTimer=null;resetUI();showError(p.error||'Analysis failed.');}
+        }).catch(function(){});
+      },3000);
+    }).catch(function(e){showError('Network error: '+e.message);resetUI();});
   };
-
   function renderResults(data){
-    document.getElementById('result-section').style.display = 'block';
-    document.getElementById('dis-name').textContent = data.predicted_disease;
-    var conf = (data.confidence * 100).toFixed(1);
-    document.getElementById('conf-txt').textContent = conf + '%';
-    document.getElementById('conf-bar').style.width  = conf + '%';
-    document.getElementById('alpha-box').textContent =
-      'Fusion: ' + (data.fusion_alpha*100).toFixed(0) + '% image / ' +
-      ((1-data.fusion_alpha)*100).toFixed(0) + '% sensor (confidence-adaptive)';
-
-    var pd2 = document.getElementById('dis-probs');
-    pd2.innerHTML = '';
-    Object.entries(data.fused_disease_probs)
-      .sort(function(a,b){return b[1]-a[1];})
-      .forEach(function(item){
-        var pct = (item[1]*100).toFixed(1);
-        pd2.innerHTML +=
-          '<div class="prob-row"><span>'+item[0]+'</span><span style="color:var(--green);font-weight:500">'+pct+'%</span></div>'+
-          '<div class="prob-mini" style="width:'+pct+'%;max-width:100%"></div>';
-      });
-
-    var fl = document.getElementById('fert-list');
-    fl.innerHTML = '';
-    Object.entries(data.fertilizer_recommendations).slice(0,5)
-      .forEach(function(item,i){
-        fl.innerHTML +=
-          '<div class="fert-row"><span class="fert-rank">'+(i+1)+'</span>'+
-          '<span class="fert-name">'+item[0]+'</span>'+
-          '<span class="fert-pct">'+(item[1]*100).toFixed(1)+'%</span></div>';
-      });
-
-    var al = document.getElementById('adv-list');
-    al.innerHTML = '';
-    data.pesticide_advisory.forEach(function(x){ al.innerHTML += '<li>'+x+'</li>'; });
-
-    if (data.gradcam_base64){
-      document.getElementById('gradcam-card').style.display = 'block';
-      document.getElementById('gradcam-img').src = 'data:image/png;base64,' + data.gradcam_base64;
-    }
+    document.getElementById('result-section').style.display='block';
+    document.getElementById('dis-name').textContent=data.predicted_disease;
+    var conf=(data.confidence*100).toFixed(1);
+    document.getElementById('conf-txt').textContent=conf+'%';
+    document.getElementById('conf-bar').style.width=conf+'%';
+    document.getElementById('alpha-box').textContent='Fusion: '+(data.fusion_alpha*100).toFixed(0)+'% image / '+((1-data.fusion_alpha)*100).toFixed(0)+'% sensor (confidence-adaptive)';
+    var pd2=document.getElementById('dis-probs');pd2.innerHTML='';
+    Object.entries(data.fused_disease_probs).sort(function(a,b){return b[1]-a[1];}).forEach(function(i){
+      var p=(i[1]*100).toFixed(1);
+      pd2.innerHTML+='<div class="prob-row"><span>'+i[0]+'</span><span style="color:var(--green);font-weight:500">'+p+'%</span></div><div class="prob-mini" style="width:'+p+'%;max-width:100%"></div>';
+    });
+    var fl=document.getElementById('fert-list');fl.innerHTML='';
+    Object.entries(data.fertilizer_recommendations).slice(0,5).forEach(function(i,idx){
+      fl.innerHTML+='<div class="fert-row"><span class="fert-rank">'+(idx+1)+'</span><span class="fert-name">'+i[0]+'</span><span class="fert-pct">'+(i[1]*100).toFixed(1)+'%</span></div>';
+    });
+    var al=document.getElementById('adv-list');al.innerHTML='';
+    data.pesticide_advisory.forEach(function(x){al.innerHTML+='<li>'+x+'</li>';});
+    if(data.gradcam_base64){document.getElementById('gradcam-card').style.display='block';document.getElementById('gradcam-img').src='data:image/png;base64,'+data.gradcam_base64;}
     document.getElementById('result-section').scrollIntoView({behavior:'smooth'});
   }
 })();
@@ -757,26 +640,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </html>"""
 
 # ============================================================
-# JOB QUEUE — async so Render 30-s proxy never triggers
+# JOB QUEUE
 # ============================================================
 _jobs      = {}
 _jobs_lock = threading.Lock()
-JOB_TIMEOUT_SECONDS = 300  # generous for free-tier CPU
-
+JOB_TIMEOUT_SECONDS = 300
 
 def _run_job(job_id, image_bytes, image_suffix, env_input):
     tmp_path = None
     try:
         t0 = time.time()
-        print(f"[JOB {job_id[:8]}] Starting analysis …")
+        print(f"[JOB {job_id[:8]}] Starting …")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=image_suffix) as tmp:
             tmp.write(image_bytes)
             tmp_path = tmp.name
 
-        print(f"[JOB {job_id[:8]}] Running CNN prediction …")
+        print(f"[JOB {job_id[:8]}] CNN predict …")
         img_probs = predict_image_disease_probs(tmp_path)
-        print(f"[JOB {job_id[:8]}] CNN done in {time.time()-t0:.1f}s")
+        print(f"[JOB {job_id[:8]}] CNN done ({time.time()-t0:.1f}s)")
 
         env_df       = preprocess_env_input(env_input)
         env_probs    = predict_env_disease_probs(env_df)
@@ -784,11 +666,11 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
         fert_probs   = predict_final_recommendations(env_df, fused)
         predicted    = max(fused, key=fused.get)
 
-        print(f"[JOB {job_id[:8]}] Generating Grad-CAM …")
+        print(f"[JOB {job_id[:8]}] Grad-CAM …")
         gradcam = generate_gradcam_base64(tmp_path)
 
         elapsed = time.time() - t0
-        print(f"[JOB {job_id[:8]}] Complete in {elapsed:.1f}s — disease={predicted}")
+        print(f"[JOB {job_id[:8]}] Done in {elapsed:.1f}s — {predicted}")
 
         result = {
             "predicted_disease":          str(predicted),
@@ -808,18 +690,13 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
     except Exception as e:
         print(f"[JOB {job_id[:8]}] FAILED: {e}")
         with _jobs_lock:
-            _jobs[job_id] = {
-                "status":    "error",
-                "error":     str(e),
-                "traceback": _tb.format_exc(),
-            }
+            _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-
 # ============================================================
-# MODEL LOADING  — in a background thread so the port opens fast
+# BACKGROUND MODEL LOADING — ← FIX: loads directly, no TF-thread nesting
 # ============================================================
 MODELS_READY = False
 MODELS_ERROR = None
@@ -827,12 +704,13 @@ MODELS_ERROR = None
 def _background_load():
     global MODELS_READY, MODELS_ERROR
     try:
-        load_all_models()
+        load_all_models()          # ← CNN build/warmup runs directly here
         MODELS_READY = True
-        print("[STARTUP] ✅  Models ready — app fully operational.")
+        print("[STARTUP] ✅ Models ready — app fully operational.")
     except Exception as _e:
         MODELS_ERROR = _tb.format_exc()
-        print("[STARTUP ERROR]", _e)
+        print(f"[STARTUP ERROR] {_e}")
+        print(MODELS_ERROR)
 
 _loader_thread = threading.Thread(target=_background_load, daemon=True)
 _loader_thread.start()
@@ -906,10 +784,9 @@ def submit():
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
-        _jobs[job_id] = {"status": "pending"}
+        _jobs[job_id] = {"status": "pending", "created": time.time()}
 
     threading.Thread(target=_run_job, args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
-
     return jsonify({"job_id": job_id})
 
 
@@ -919,19 +796,15 @@ def result(job_id):
         job = _jobs.get(job_id)
     if job is None:
         return jsonify({"status": "error", "error": "Unknown job ID"}), 404
-
-    # Check if job has been pending too long
     if job.get("status") == "pending":
         created = job.get("created", time.time())
         if time.time() - created > JOB_TIMEOUT_SECONDS:
             with _jobs_lock:
                 _jobs[job_id] = {
                     "status": "error",
-                    "error": f"Analysis timed out after {JOB_TIMEOUT_SECONDS}s. "
-                             "The server CPU may be overloaded. Please try again.",
+                    "error": f"Analysis timed out after {JOB_TIMEOUT_SECONDS}s."
                 }
             return jsonify(_jobs[job_id])
-
     return jsonify(job)
 
 
