@@ -248,18 +248,27 @@ def load_all_models():
     print(f"[STARTUP] Temperature T={MODELS['temperature']:.4f}")
     print("[STARTUP] All models loaded successfully.")
 
+    # Warm up: run one dummy inference in the main thread so TF builds its graph here.
+    # This prevents deadlocks when background threads later call the model.
+    print("[STARTUP] Warming up CNN model...")
+    dummy = tf.zeros([1, IMG_SIZE[0], IMG_SIZE[1], 3], dtype=tf.float32)
+    _ = MODELS["cnn"](dummy, training=False)
+    print("[STARTUP] Warmup complete.")
+
 # ============================================================
 # INFERENCE
 # ============================================================
 
 def predict_image_disease_probs(image_path):
-    img     = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
-    arr     = tf.keras.utils.img_to_array(img)
-    arr     = tf.keras.applications.efficientnet.preprocess_input(np.expand_dims(arr, 0))
-    raw     = MODELS["cnn"].predict(arr, verbose=0)[0]
-    cal     = apply_temperature_scaling(raw, MODELS["temperature"])
-    raw_p   = {cls: float(p) for cls, p in zip(MODELS["class_names"], cal)}
-    canon   = {d: 0.0 for d in CANONICAL_DISEASE_CLASSES}
+    img   = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+    arr   = tf.keras.utils.img_to_array(img)
+    arr   = tf.keras.applications.efficientnet.preprocess_input(np.expand_dims(arr, 0))
+    arr   = tf.constant(arr, dtype=tf.float32)
+    # Direct model call is thread-safe; model.predict() deadlocks in background threads
+    raw   = MODELS["cnn"](arr, training=False).numpy()[0]
+    cal   = apply_temperature_scaling(raw, MODELS["temperature"])
+    raw_p = {cls: float(p) for cls, p in zip(MODELS["class_names"], cal)}
+    canon = {d: 0.0 for d in CANONICAL_DISEASE_CLASSES}
     for rn, p in raw_p.items():
         c = to_canonical_name(rn)
         if c in canon:
@@ -643,6 +652,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
 # ============================================================
 _jobs      = {}
 _jobs_lock = threading.Lock()
+JOB_TIMEOUT_SECONDS = 180  # mark job failed if it takes longer than this
+
+def _watchdog(job_id, timeout):
+    """Background timer — marks job as error if it never completes."""
+    import time
+    time.sleep(timeout)
+    with _jobs_lock:
+        if _jobs.get(job_id, {}).get("status") == "pending":
+            _jobs[job_id] = {
+                "status": "error",
+                "error": f"Analysis timed out after {timeout}s. "
+                         "The server CPU may be overloaded. Please try again."
+            }
 
 def _run_job(job_id, image_bytes, image_suffix, env_input):
     tmp_path = None
@@ -672,11 +694,14 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
             "gradcam_base64":             gradcam,
         }
         with _jobs_lock:
-            _jobs[job_id] = {"status": "done", "result": to_python(result)}
+            # Only write result if watchdog hasn't already timed it out
+            if _jobs.get(job_id, {}).get("status") == "pending":
+                _jobs[job_id] = {"status": "done", "result": to_python(result)}
 
     except Exception as e:
         with _jobs_lock:
-            _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
+            if _jobs.get(job_id, {}).get("status") == "pending":
+                _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -764,11 +789,8 @@ def submit():
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending"}
 
-    threading.Thread(
-        target=_run_job,
-        args=(job_id, image_bytes, image_suffix, env_input),
-        daemon=True
-    ).start()
+    threading.Thread(target=_run_job,   args=(job_id, image_bytes, image_suffix, env_input), daemon=True).start()
+    threading.Thread(target=_watchdog,  args=(job_id, JOB_TIMEOUT_SECONDS),                  daemon=True).start()
 
     return jsonify({"job_id": job_id})
 
