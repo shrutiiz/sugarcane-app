@@ -314,15 +314,18 @@ def predict_final_recommendations(env_df, fused_disease_probs):
 
 def generate_gradcam_base64(image_path):
     try:
-        cnn     = MODELS["cnn"]
-        img     = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+        cnn = MODELS["cnn"]
+        img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
         img_arr = tf.keras.utils.img_to_array(img)
-        proc    = tf.keras.applications.efficientnet.preprocess_input(
-                      np.expand_dims(img_arr.copy(), 0).astype(np.float32))
-        tensor  = tf.convert_to_tensor(proc, dtype=tf.float32)
+        proc = tf.keras.applications.efficientnet.preprocess_input(
+            np.expand_dims(img_arr.copy(), 0).astype(np.float32)
+        )
+        tensor = tf.convert_to_tensor(proc, dtype=tf.float32)
 
-        base_model = next((l for l in cnn.layers
-                           if isinstance(l, tf.keras.Model) and "efficientnet" in l.name.lower()), None)
+        base_model = next(
+            (l for l in cnn.layers if isinstance(l, tf.keras.Model) and "efficientnet" in l.name.lower()),
+            None
+        )
         if base_model is None:
             return None
 
@@ -330,27 +333,33 @@ def generate_gradcam_base64(image_path):
             inputs=cnn.inputs,
             outputs=[base_model.get_layer("top_conv").output, cnn.output]
         )
+
         with tf.GradientTape() as tape:
             conv_out, preds = grad_model(tensor, training=False)
             class_ch = preds[:, tf.argmax(preds[0])]
-        grads   = tape.gradient(class_ch, conv_out)
-        pooled  = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        grads = tape.gradient(class_ch, conv_out)
+        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
         heatmap = tf.reduce_sum(conv_out[0] * pooled, axis=-1).numpy()
         heatmap = np.maximum(heatmap, 0)
         heatmap /= (heatmap.max() + 1e-8)
+
         heatmap_r = np.array(tf.image.resize(heatmap[..., np.newaxis], IMG_SIZE)).squeeze()
-        cmap    = cm_module.get_cmap("jet")
+        cmap = cm_module.get_cmap("jet")
         overlay = np.clip(0.5 * (img_arr / 255.0) + 0.5 * cmap(heatmap_r)[:, :, :3], 0, 1)
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(img_arr.astype(np.uint8)); axes[0].set_title("Input Leaf"); axes[0].axis("off")
-        axes[1].imshow(overlay);                  axes[1].set_title("Grad-CAM");   axes[1].axis("off")
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.imshow(overlay)
+        ax.set_title("Grad-CAM")
+        ax.axis("off")
         plt.tight_layout()
+
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.savefig(buf, format="png", dpi=60, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode("utf-8")
+
     except Exception as e:
         print(f"[WARN] Grad-CAM failed: {e}")
         return None
@@ -569,34 +578,99 @@ HTML_PAGE = r"""<!DOCTYPE html>
     fd.append('Soil Type',   document.getElementById('soil').value);
     fd.append('Crop Type',   document.getElementById('crop').value);
 
-    fetch('/submit', {method:'POST', body:fd})
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        if (d.error){ showError(d.error); resetUI(); return; }
-        var jobId   = d.job_id;
-        var elapsed = 0;
-        btn.textContent = 'Analyzing...';
-        setStatus('AI is analyzing your image...');
+fetch('/submit', {method:'POST', body:fd})
+  .then(function(r){
+    return r.text().then(function(text){
+      return { ok: r.ok, status: r.status, text: text };
+    });
+  })
+  .then(function(resp){
+    var d = null;
 
-        pollTimer = setInterval(function(){
-          elapsed += 3;
-          setStatus('Analyzing... (' + elapsed + 's elapsed)');
-          fetch('/result/' + jobId)
-            .then(function(r){ return r.json(); })
-            .then(function(poll){
-              if (poll.status === 'done'){
-                clearInterval(pollTimer); pollTimer = null;
-                resetUI();
-                if (poll.error) showError(poll.error + (poll.traceback ? '\n\n' + poll.traceback : ''));
-                else            renderResults(poll.result);
-              } else if (poll.status === 'error'){
-                clearInterval(pollTimer); pollTimer = null;
-                resetUI();
-                showError(poll.error || 'Analysis failed.');
-              }
-            })
-            .catch(function(){});
-        }, 3000);
+    try {
+      d = resp.text ? JSON.parse(resp.text) : null;
+    } catch (e) {
+      showError('Server returned invalid response (HTTP ' + resp.status + ').');
+      resetUI();
+      return;
+    }
+
+    if (!resp.ok) {
+      showError((d && d.error) ? d.error : ('Server error (HTTP ' + resp.status + ')'));
+      resetUI();
+      return;
+    }
+
+    if (!d) {
+      showError('Empty response from server.');
+      resetUI();
+      return;
+    }
+
+    if (d.error) {
+      showError(d.error);
+      resetUI();
+      return;
+    }
+
+    var jobId = d.job_id;
+    var elapsed = 0;
+    btn.textContent = 'Analyzing...';
+    setStatus('AI is analyzing your image...');
+
+    pollTimer = setInterval(function(){
+      elapsed += 3;
+      setStatus('Analyzing... (' + elapsed + 's elapsed)');
+    
+      fetch('/result/' + jobId)
+        .then(function(r){
+          return r.text().then(function(text){
+            return { ok: r.ok, status: r.status, text: text };
+          });
+        })
+        .then(function(resp){
+          var poll = null;
+    
+          try {
+            poll = resp.text ? JSON.parse(resp.text) : null;
+          } catch (e) {
+            clearInterval(pollTimer); pollTimer = null;
+            resetUI();
+            showError('Server returned invalid response (HTTP ' + resp.status + ').');
+            return;
+          }
+    
+          if (!resp.ok) {
+            clearInterval(pollTimer); pollTimer = null;
+            resetUI();
+            showError((poll && poll.error) ? poll.error : ('Server error (HTTP ' + resp.status + ')'));
+            return;
+          }
+    
+          if (!poll) {
+            clearInterval(pollTimer); pollTimer = null;
+            resetUI();
+            showError('Empty response from server.');
+            return;
+          }
+    
+          if (poll.status === 'done') {
+            clearInterval(pollTimer); pollTimer = null;
+            resetUI();
+            renderResults(poll.result);
+          } else if (poll.status === 'error') {
+            clearInterval(pollTimer); pollTimer = null;
+            resetUI();
+            showError(poll.error || 'Analysis failed.');
+          }
+        })
+        .catch(function(){
+          clearInterval(pollTimer); pollTimer = null;
+          resetUI();
+          showError('Network error while polling result.');
+        });
+    
+    }, 3000);
       })
       .catch(function(e){ showError('Network error: ' + e.message); resetUI(); });
   };
@@ -636,10 +710,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
     al.innerHTML = '';
     data.pesticide_advisory.forEach(function(x){ al.innerHTML += '<li>'+x+'</li>'; });
 
-    if (data.gradcam_base64){
-      document.getElementById('gradcam-card').style.display = 'block';
-      document.getElementById('gradcam-img').src = 'data:image/png;base64,' + data.gradcam_base64;
-    }
+if (data.gradcam_base64){
+  document.getElementById('gradcam-card').style.display = 'block';
+  document.getElementById('gradcam-img').src = 'data:image/png;base64,' + data.gradcam_base64;
+}
+
+// Load Grad-CAM separately after main result is shown
+if (data.job_id) {
+  fetch('/gradcam/' + data.job_id)
+    .then(function(r){
+      return r.text().then(function(text){
+        return { ok: r.ok, status: r.status, text: text };
+      });
+    })
+    .then(function(resp){
+      var gc = null;
+      try {
+        gc = resp.text ? JSON.parse(resp.text) : null;
+      } catch (e) {
+        return;
+      }
+
+      if (!resp.ok || !gc) return;
+
+      if (gc.gradcam_base64) {
+        document.getElementById('gradcam-card').style.display = 'block';
+        document.getElementById('gradcam-img').src = 'data:image/png;base64,' + gc.gradcam_base64;
+      }
+    })
+    .catch(function(){});
+}
     document.getElementById('result-section').scrollIntoView({behavior:'smooth'});
   }
 })();
@@ -679,9 +779,11 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
         fused, alpha = fuse_disease_probabilities(img_probs, env_probs)
         fert_probs   = predict_final_recommendations(env_df, fused)
         predicted    = max(fused, key=fused.get)
-        gradcam      = generate_gradcam_base64(tmp_path)
+        gradcam = None
+        saved_input_path = tmp_path
 
         result = {
+            "job_id":                      job_id,
             "predicted_disease":          str(predicted),
             "confidence":                 float(fused[predicted]),
             "fusion_alpha":               float(alpha),
@@ -691,7 +793,8 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
             "fertilizer_recommendations": {k: float(v) for k, v in fert_probs.items()},
             "top_fertilizer":             str(max(fert_probs, key=fert_probs.get)),
             "pesticide_advisory":         [str(x) for x in PESTICIDE_ADVISORY.get(predicted, [])],
-            "gradcam_base64":             gradcam,
+            "gradcam_base64":             None,
+            "input_image_path":           saved_input_path,
         }
         with _jobs_lock:
             # Only write result if watchdog hasn't already timed it out
@@ -703,8 +806,7 @@ def _run_job(job_id, image_bytes, image_suffix, env_input):
             if _jobs.get(job_id, {}).get("status") == "pending":
                 _jobs[job_id] = {"status": "error", "error": str(e), "traceback": _tb.format_exc()}
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        pass
 
 # ============================================================
 # STARTUP  —  blocking load before gunicorn forks workers
@@ -758,6 +860,8 @@ def health():
     return "Loading...", 200
 
 
+
+
 @app.route("/submit", methods=["POST"])
 def submit():
     if MODELS_ERROR:
@@ -802,6 +906,30 @@ def result(job_id):
     if job is None:
         return jsonify({"status": "error", "error": "Unknown job ID"}), 404
     return jsonify(job)
+
+@app.route("/gradcam/<job_id>")
+def gradcam(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None:
+        return jsonify({"error": "Unknown job ID"}), 404
+
+    if job.get("status") != "done":
+        return jsonify({"error": "Result not ready yet"}), 400
+
+    result = job.get("result", {})
+    image_path = result.get("input_image_path")
+    if not image_path or not os.path.exists(image_path):
+        return jsonify({"error": "Image not available for Grad-CAM"}), 404
+
+    try:
+        gradcam_b64 = generate_gradcam_base64(image_path)
+        if os.path.exists(image_path):
+            os.unlink(image_path)
+        return jsonify({"gradcam_base64": gradcam_b64})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
