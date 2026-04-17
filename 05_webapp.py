@@ -48,7 +48,7 @@ SOIL_ENCODER_PATH        = os.path.join(ARTIFACT_DIR, "soil_encoder.pkl")
 CROP_ENCODER_PATH        = os.path.join(ARTIFACT_DIR, "crop_encoder.pkl")
 NUMERIC_SCALER_PATH      = os.path.join(ARTIFACT_DIR, "numeric_scaler.pkl")
 
-IMG_SIZE = (128, 128)
+IMG_SIZE = (96, 96)
 
 CANONICAL_DISEASE_CLASSES = [
     "BacterialBlight", "Healthy", "Mosaic", "RedRot", "Rust", "YellowLeaf"
